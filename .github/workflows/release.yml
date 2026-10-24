@@ -1,0 +1,86 @@
+name: release
+
+# Runs on a vX.Y.Z tag: builds the binaries, attaches them with an SPDX SBOM each and their
+# checksums to the release, and attests where they were built, so a user can verify an archive or
+# its SBOM with `gh attestation verify`.
+
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    name: goreleaser
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # goreleaser derives the version from tags, so a shallow clone breaks it.
+          fetch-depth: 0
+
+      - name: Setup go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          # A tag run restores caches the default branch wrote, and a restored module skips the go.sum check.
+          cache: false
+
+      # The last chance to stop a broken server before it reaches anyone's assistant.
+      - name: Test
+        run: go test ./...
+
+      # The tag's message is the reviewed release notes. The tag is fetched again because checkout
+      # can leave an annotated tag lightweight, which has no message.
+      - name: Release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          git tag -l --format='%(contents:body)' "$TAG" > "$RUNNER_TEMP/notes.md"
+
+      # GoReleaser writes the SBOMs with syft. It is a release binary pinned by version and checksum
+      # rather than another action, since the public repositories allow only the actions they list.
+      - name: Install syft
+        env:
+          SYFT_VERSION: 1.52.0
+          SYFT_SHA256: caeedb81fb0491615f1ebd1761e4145d41ee86dd2cc7bf80669f9f5ad9d6133d
+        run: |
+          set -euo pipefail
+          archive="syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --max-time 120 --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/${archive}"
+          echo "${SYFT_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/syft"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/syft" syft
+          echo "$RUNNER_TEMP/syft" >> "$GITHUB_PATH"
+
+      - name: Release
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          args: release --clean --release-notes ${{ runner.temp }}/notes.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # GoReleaser names files with the version without its leading v.
+      - name: Checksum file
+        id: checksums
+        env:
+          TAG: ${{ github.ref_name }}
+        run: echo "path=dist/costfluent-mcp_${TAG#v}_checksums.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: ${{ steps.checksums.outputs.path }}
