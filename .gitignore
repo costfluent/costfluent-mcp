@@ -1,0 +1,15 @@
+# What `make build` and a GoReleaser snapshot leave here
+/bin/
+/dist/
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.test
+
+# Go workspace file
+go.work
+go.work.sum
+
+.env
+.idea/
