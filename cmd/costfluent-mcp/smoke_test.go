@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +19,7 @@ import (
 const (
 	smokeTokenEnv   = "COSTFLUENT_MCP_SMOKE_API_TOKEN"
 	smokeBaseURLEnv = "COSTFLUENT_MCP_SMOKE_BASE_URL"
-	smokeBaseURL    = "https://api.dev.costfluent.com"
+	smokeBaseURL    = "https://api.costfluent.dev"
 )
 
 // TestSmokeAgainstADeployedAPI starts the server over stdio against a deployed Public API and
@@ -52,48 +54,94 @@ func TestSmokeAgainstADeployedAPI(t *testing.T) {
 	if len(tools.Tools) == 0 {
 		t.Fatalf("the token is served no tools; give it read capabilities\n%s", stderr)
 	}
+	// An organization token reads a workspace's objects only when told which workspace, as an
+	// assistant learns from list_workspaces; a workspace token's own is the default.
+	workspace := ""
+	if slices.ContainsFunc(tools.Tools, func(tool *mcp.Tool) bool { return tool.Name == "list_workspaces" }) {
+		text := smokeCall(ctx, t, cs, "list_workspaces", nil)
+		var listed struct {
+			Items []struct {
+				ID string `json:"id"`
+			} `json:"items"`
+		}
+		if json.Unmarshal([]byte(text), &listed) != nil || len(listed.Items) == 0 {
+			t.Fatalf("list_workspaces named no workspace: %s", text)
+		}
+		workspace = listed.Items[0].ID
+		t.Logf("reading workspace %s", workspace)
+	}
 	end := time.Now().UTC()
 	window := map[string]any{"start_date": end.AddDate(0, 0, -7).Format(time.DateOnly), "end_date": end.Format(time.DateOnly)}
 	var reportID string
 	for _, tool := range tools.Tools {
 		args := map[string]any{}
 		switch tool.Name {
-		case "query_costs":
-			args = window
+		case "list_workspaces":
+			continue // called above
+		case "query_costs", "get_commitment_coverage":
+			maps.Copy(args, window)
+		case "get_kubernetes_efficiency":
+			maps.Copy(args, window)
+			args["level"] = "cluster"
 		case "get_cost_report_data":
 			continue // called below with a report list_cost_reports named
 		}
-		res := smokeCall(ctx, t, cs, tool.Name, args)
+		if workspace != "" && takes(tool, "workspace_id") {
+			args["workspace_id"] = workspace
+		}
+		text := smokeCall(ctx, t, cs, tool.Name, args)
 		if tool.Name == "list_cost_reports" {
 			var out struct {
 				Reports []struct {
 					ID string `json:"id"`
 				} `json:"reports"`
 			}
-			body, _ := json.Marshal(res.StructuredContent)
-			if json.Unmarshal(body, &out) == nil && len(out.Reports) > 0 {
+			if json.Unmarshal([]byte(text), &out) == nil && len(out.Reports) > 0 {
 				reportID = out.Reports[0].ID
 			}
 		}
 	}
 	if reportID != "" {
-		smokeCall(ctx, t, cs, "get_cost_report_data", map[string]any{"cost_report_id": reportID})
+		args := map[string]any{"cost_report_id": reportID}
+		if workspace != "" {
+			args["workspace_id"] = workspace
+		}
+		smokeCall(ctx, t, cs, "get_cost_report_data", args)
 	}
 	if strings.Contains(stderr.String(), token) {
 		t.Error("the server logged its token")
 	}
 }
 
-func smokeCall(ctx context.Context, t *testing.T, cs *mcp.ClientSession, name string, args map[string]any) *mcp.CallToolResult {
+// takes reports whether the tool's input schema has the argument.
+func takes(tool *mcp.Tool, argument string) bool {
+	var schema struct {
+		Properties map[string]any `json:"properties"`
+	}
+	raw, _ := json.Marshal(tool.InputSchema)
+	_ = json.Unmarshal(raw, &schema)
+	_, ok := schema.Properties[argument]
+	return ok
+}
+
+// smokeCall calls one tool and returns the text an assistant reads, failing the test with that
+// text when the call is refused.
+func smokeCall(ctx context.Context, t *testing.T, cs *mcp.ClientSession, name string, args map[string]any) string {
 	t.Helper()
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
 	if err != nil {
 		t.Fatalf("%s: %v", name, err)
 	}
+	var text strings.Builder
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			text.WriteString(tc.Text)
+		}
+	}
 	if res.IsError {
-		t.Errorf("%s refused: %v", name, res.Content)
+		t.Errorf("%s refused: %s", name, text.String())
 	} else {
 		t.Logf("%s: ok", name)
 	}
-	return res
+	return text.String()
 }
