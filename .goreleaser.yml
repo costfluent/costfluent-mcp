@@ -4,10 +4,10 @@ version: 2
 # the ones the install instructions name.
 project_name: costfluent-mcp
 
-# The release body is the tag's message, which the release workflow passes as --release-notes. A
-# changelog would list commit subjects, and every one of them is "Bump to <version>".
-changelog:
-  disable: true
+# The release body is the tag's message, which the release workflow passes as --release-notes.
+# Given a notes file, GoReleaser builds no changelog from commit subjects, all "Bump to <version>".
+# The changelog stays enabled because that step is what loads the file: disabled, it published every
+# release with an empty body.
 
 builds:
   - main: ./cmd/costfluent-mcp

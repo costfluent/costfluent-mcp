@@ -1,7 +1,8 @@
 # Costfluent MCP server
 
 An [MCP](https://modelcontextprotocol.io) server that lets an AI assistant read your Costfluent
-cloud cost data: costs over time, saved cost reports, budgets and anomalies. It runs on your
+cloud cost data: costs over time, saved cost reports, budgets, anomalies, the savings queue,
+commitments and their coverage, and Kubernetes efficiency. It runs on your
 machine, talks to your assistant over stdin and stdout, and calls the Costfluent Public API with an
 API token you give it. It reads; it never changes anything.
 
@@ -70,8 +71,13 @@ refuses any other.
 | `query_costs` | Cost, usage or resource count over a date range, grouped and filtered | `viewCosts` (View costs) |
 | `list_cost_reports` | A workspace's saved cost reports | `viewCostReports` (View cost reports) |
 | `get_cost_report_data` | The numbers a saved report shows now | `viewCosts` (View costs) |
+| `list_annotations` | A workspace's annotations by date: notes on its cost reports and the markers budgets and cost alerts leave as they fire, by report or date range, open ones unless resolved ones are asked for | `viewCostReports` (View cost reports) |
 | `list_budgets` | Budgets with their spend and state | `viewBudgets` (View budgets) |
 | `list_anomalies` | Detected cost anomalies | `viewAnomalies` (View anomalies) |
+| `list_savings_items` | The savings queue's findings, filtered by tab, source, kind, connection or minimum monthly saving | `viewSavingsItems` (View savings) |
+| `list_commitments` | Reservations, savings plans and committed use discounts with their term and utilization | `viewCosts` (View costs) |
+| `get_commitment_coverage` | Coverage, effective savings rate and unused commitment over a date range, by month unless asked otherwise | `viewCosts` (View costs) |
+| `get_kubernetes_efficiency` | Cost, idle cost and CPU and memory efficiency per cluster, namespace or workload, at most 500 rows | `viewCosts` (View costs) |
 
 When the API refuses a call, the assistant receives the API's error, with its status, code and
 detail. The token's request quota applies to every call; the server waits out a short limit and

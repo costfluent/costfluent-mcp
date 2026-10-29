@@ -150,3 +150,70 @@ func TestRunRefusesAMissingTokenOrABadAPI(t *testing.T) {
 		})
 	}
 }
+
+// slowAPI answers GET /v1/me at once and /v1/budgets after delay.
+func slowAPI(t *testing.T, delay time.Duration) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/me":
+			_, _ = io.WriteString(w, `{"organizationId":"org_1","workspaceId":"ws_own","tokenType":"workspace","tokenName":"assistant","capabilities":["viewBudgets"]}`)
+		case "/v1/budgets":
+			select {
+			case <-time.After(delay):
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = io.WriteString(w, `{"links":{"self":"/v1/budgets"},"data":[{"id":"bud_1","name":"Production","amount":"100.00000000","currency":"USD","state":"onTrack"}]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// callThroughRun serves run in this process over an in-memory transport and calls list_budgets.
+func callThroughRun(t *testing.T, apiURL string) (*mcp.CallToolResult, time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientT, serverT := mcp.NewInMemoryTransports()
+	env := map[string]string{"COSTFLUENT_API_TOKEN": secret, "COSTFLUENT_BASE_URL": apiURL}
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, func(k string) string { return env[k] }, slog.New(slog.DiscardHandler), serverT)
+	}()
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "test"}, nil).Connect(ctx, clientT, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cs.Close(); cancel(); <-done }()
+	start := time.Now()
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "list_budgets"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res, time.Since(start)
+}
+
+func TestRunWaitsEachAPIAttemptForItsTimeoutAndNoLonger(t *testing.T) {
+	saved := apiAttemptTimeout
+	t.Cleanup(func() { apiAttemptTimeout = saved })
+
+	// A read slower than the bound ends with the SDK's timeout, not the read's answer, and at the
+	// bound: run passes the bound to the client rather than leaving the SDK's 30-second default.
+	apiAttemptTimeout = 300 * time.Millisecond
+	res, took := callThroughRun(t, slowAPI(t, 2*time.Second).URL)
+	body, _ := json.Marshal(res.Content)
+	if !res.IsError || !strings.Contains(string(body), "timed out after 300ms") || took > 1500*time.Millisecond {
+		t.Errorf("a read past a 300ms bound: IsError %v after %s, %s; want the timeout at the bound", res.IsError, took, body)
+	}
+
+	// A read inside the bound is answered.
+	apiAttemptTimeout = 5 * time.Second
+	if res, _ := callThroughRun(t, slowAPI(t, 500*time.Millisecond).URL); res.IsError {
+		body, _ := json.Marshal(res.Content)
+		t.Errorf("a 500ms read under a 5s bound failed: %s", body)
+	}
+}

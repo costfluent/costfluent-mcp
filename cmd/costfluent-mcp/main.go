@@ -24,6 +24,9 @@ import (
 // version is set at release by -ldflags "-X main.version=...".
 var version = "dev"
 
+// apiAttemptTimeout bounds each attempt at an API call; a variable only so tests can shorten it.
+var apiAttemptTimeout = server.APIAttemptTimeout
+
 func main() {
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -52,6 +55,7 @@ func run(ctx context.Context, getenv func(string) string, logger *slog.Logger, t
 		costfluent.WithAPIKey(cfg.APIToken),
 		costfluent.WithBaseURL(cfg.BaseURL),
 		costfluent.WithUserAgent("costfluent-mcp/"+version),
+		costfluent.WithTimeout(apiAttemptTimeout),
 	)
 	srv, me, err := server.New(ctx, client, version)
 	if err != nil {
