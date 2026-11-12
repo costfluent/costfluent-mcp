@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -26,6 +27,18 @@ var version = "dev"
 
 // apiAttemptTimeout bounds each attempt at an API call; a variable only so tests can shorten it.
 var apiAttemptTimeout = server.APIAttemptTimeout
+
+// maxRetryAfter is the longest wait the API asks for that a call waits out before sending again. It
+// sits under the 30 seconds the API asks for with every 503 and 504, so those go straight back to the
+// assistant: the 503 that ends a read the API gave up on after 90 seconds returns after one attempt,
+// with the API's advice to narrow the read. That holds only while the Retry-After the API sends when
+// a request times out stays above this cap; at or under it, the read the API gave up on would be
+// sent again. A rate limit asking for longer goes back with its wait and a shorter one is waited
+// out; only a failure that names no wait, such as a bare 5xx from a proxy in front of the API, still
+// gets the SDK's backoff. A bound on the whole call, as the hosted server has, cannot tell those
+// waits from the 503's and would end an honest read after a rate-limit wait with the advice to
+// narrow it.
+const maxRetryAfter = 29 * time.Second
 
 func main() {
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -56,6 +69,7 @@ func run(ctx context.Context, getenv func(string) string, logger *slog.Logger, t
 		costfluent.WithBaseURL(cfg.BaseURL),
 		costfluent.WithUserAgent("costfluent-mcp/"+version),
 		costfluent.WithTimeout(apiAttemptTimeout),
+		costfluent.WithMaxRetryAfter(maxRetryAfter),
 	)
 	srv, me, err := server.New(ctx, client, version)
 	if err != nil {

@@ -33,26 +33,35 @@ func (c Config) String() string {
 
 // Load reads the configuration through getenv, such as os.Getenv.
 func Load(getenv func(string) string) (Config, error) {
-	cfg := Config{
-		APIToken: strings.TrimSpace(getenv(EnvAPIToken)),
-		BaseURL:  strings.TrimSpace(getenv(EnvBaseURL)),
+	token := strings.TrimSpace(getenv(EnvAPIToken))
+	if token == "" {
+		return Config{}, errors.New(EnvAPIToken + " is not set: create an API token under Settings, API tokens, and set it in the environment the MCP server or the costfluent command runs in")
 	}
-	if cfg.APIToken == "" {
-		return Config{}, errors.New(EnvAPIToken + " is not set: create an API token under Settings, API tokens, and pass it in the server's environment")
+	baseURL, err := BaseURL(getenv)
+	if err != nil {
+		return Config{}, err
 	}
-	if cfg.BaseURL == "" {
-		cfg.BaseURL = DefaultBaseURL
-	}
-	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
-	if err := checkBaseURL(cfg.BaseURL); err != nil {
-		return Config{}, fmt.Errorf("%s: %w", EnvBaseURL, err)
-	}
-	return cfg, nil
+	return Config{APIToken: token, BaseURL: baseURL}, nil
 }
 
-// checkBaseURL refuses a base URL that would send the token in the clear, except to the local
-// machine, where a development stack listens.
-func checkBaseURL(raw string) error {
+// BaseURL reads the Public API's base URL through getenv, DefaultBaseURL when EnvBaseURL is unset,
+// without a trailing slash. It needs no token, so costfluent login reads the API it signs in to here.
+func BaseURL(getenv func(string) string) (string, error) {
+	baseURL := strings.TrimSpace(getenv(EnvBaseURL))
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
+	if err := CheckURL(baseURL); err != nil {
+		return "", fmt.Errorf("%s: %w", EnvBaseURL, err)
+	}
+	return baseURL, nil
+}
+
+// CheckURL refuses a URL that would send a token in the clear, except to the local machine, where a
+// development stack listens: the API's base URL, and the authorization server's endpoints the
+// costfluent login sends codes and tokens to.
+func CheckURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("%q is not a URL: %w", raw, err)
@@ -66,5 +75,5 @@ func checkBaseURL(raw string) error {
 	case u.Scheme == "http" && slices.Contains([]string{"localhost", "127.0.0.1", "::1"}, u.Hostname()):
 		return nil
 	}
-	return fmt.Errorf("%q must use https, because the API token travels with every request; plain http is allowed only for localhost, 127.0.0.1 and ::1", raw)
+	return fmt.Errorf("%q must use https, because a token travels with every request to it; plain http is allowed only for localhost, 127.0.0.1 and ::1", raw)
 }

@@ -1,0 +1,9 @@
+model = "gpt-5"
+
+[mcp_servers.github]
+command = "gh-mcp"
+
+[mcp_servers.costfluent]
+command = "/opt/costfluent/bin/costfluent-mcp"
+args = []
+env_vars = ["COSTFLUENT_API_TOKEN"]

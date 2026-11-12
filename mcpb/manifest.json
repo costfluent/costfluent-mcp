@@ -1,0 +1,57 @@
+{
+  "manifest_version": "0.3",
+  "name": "costfluent-mcp",
+  "display_name": "Costfluent",
+  "version": "0.0.0",
+  "description": "Read your Costfluent cloud costs, reports, budgets, anomalies and savings from your assistant.",
+  "author": {
+    "name": "Costfluent",
+    "url": "https://costfluent.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/costfluent/costfluent-mcp"
+  },
+  "homepage": "https://costfluent.com",
+  "documentation": "https://docs.costfluent.com/developers/mcp",
+  "license": "Apache-2.0",
+  "keywords": ["cloud costs", "finops", "budgets", "anomalies"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/darwin/costfluent-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/server/darwin/costfluent-mcp",
+      "env": {
+        "COSTFLUENT_API_TOKEN": "${user_config.api_token}",
+        "COSTFLUENT_BASE_URL": "${user_config.base_url}"
+      },
+      "platform_overrides": {
+        "linux": {
+          "command": "${__dirname}/server/linux/costfluent-mcp"
+        },
+        "win32": {
+          "command": "${__dirname}/server/win32/costfluent-mcp.exe"
+        }
+      }
+    }
+  },
+  "user_config": {
+    "api_token": {
+      "type": "string",
+      "title": "API token",
+      "description": "A Costfluent API token, best from the Read only preset under Settings, API tokens.",
+      "sensitive": true,
+      "required": true
+    },
+    "base_url": {
+      "type": "string",
+      "title": "API URL",
+      "description": "The Costfluent Public API to call. Keep the default unless Costfluent told you otherwise.",
+      "default": "https://api.costfluent.com",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"]
+  }
+}

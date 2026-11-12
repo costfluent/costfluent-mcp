@@ -1,0 +1,45 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.costfluent/costfluent-mcp",
+  "title": "Costfluent",
+  "description": "Read your Costfluent cloud costs, reports, budgets, anomalies and savings from your assistant.",
+  "websiteUrl": "https://docs.costfluent.com/developers/mcp",
+  "icons": [
+    {
+      "src": "https://costfluent.com/favicon/web-app-manifest-512x512.png",
+      "mimeType": "image/png",
+      "sizes": ["512x512"]
+    },
+    {
+      "src": "https://costfluent.com/favicon/favicon.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": ["any"]
+    }
+  ],
+  "repository": {
+    "url": "https://github.com/costfluent/costfluent-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "COSTFLUENT_API_TOKEN",
+          "description": "A Costfluent API token, best from the Read only preset.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "COSTFLUENT_BASE_URL",
+          "description": "The Costfluent Public API to call.",
+          "default": "https://api.costfluent.com",
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

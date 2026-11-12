@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "costfluent": {
+      "type": "local",
+      "command": "/opt/costfluent/bin/costfluent-mcp",
+      "args": [],
+      "env": {
+        "COSTFLUENT_API_TOKEN": "${COSTFLUENT_API_TOKEN}"
+      },
+      "tools": [
+        "*"
+      ]
+    }
+  }
+}
