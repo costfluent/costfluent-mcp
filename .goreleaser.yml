@@ -9,8 +9,11 @@ project_name: costfluent-mcp
 # The changelog stays enabled because that step is what loads the file: disabled, it published every
 # release with an empty body.
 
+# Two builds, the stdio server and the CLI, which every archive holds side by side: the CLI's
+# `mcp install` names the costfluent-mcp beside it, and the Homebrew formula installs both.
 builds:
-  - main: ./cmd/costfluent-mcp
+  - id: costfluent-mcp
+    main: ./cmd/costfluent-mcp
     env:
       - CGO_ENABLED=0
     mod_timestamp: '{{ .CommitTimestamp }}'
@@ -26,9 +29,37 @@ builds:
       - amd64
       - arm64
     binary: costfluent-mcp
+  - id: costfluent
+    main: ./cmd/costfluent
+    env:
+      - CGO_ENABLED=0
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    flags:
+      - -trimpath
+    ldflags:
+      - '-s -w -X main.version={{.Version}}'
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    binary: costfluent
+
+# The macOS server of the MCPB bundle the release workflow packs: an MCPB manifest picks a binary by
+# operating system alone, so one universal binary serves both Mac architectures. It is not archived
+# (the archives name only the two builds) and so neither uploaded nor in the checksum file; the
+# bundle that holds it is attested on its own.
+universal_binaries:
+  - id: costfluent-mcp-universal
+    ids: [costfluent-mcp]
+    name_template: costfluent-mcp
+    mod_timestamp: '{{ .CommitTimestamp }}'
 
 archives:
-  - formats: [tar.gz]
+  - ids: [costfluent-mcp, costfluent]
+    formats: [tar.gz]
     format_overrides:
       - goos: windows
         formats: [zip]

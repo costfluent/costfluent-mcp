@@ -1,0 +1,1678 @@
+# Costfluent Docs
+
+> Complete documentation for Large Language Models
+
+
+---
+
+## Document: Terraform
+
+Manage Costfluent objects as code with its Terraform provider, connect cloud accounts in the same apply, and bring objects made in the product under Terraform.
+
+URL: /developers/terraform
+
+
+# Terraform
+
+Costfluent publishes a Terraform provider and three cost-access modules on the public Terraform Registry. The registry holds the full reference for each resource and input; this page covers how to set them up, how they fit together, and how objects made in the product come under Terraform.
+
+## Before you start
+
+<PlanAvailability feature="ApiTokens" plan="Pro" />
+
+- Creating the token the provider uses, with the whole **Read and write** preset, needs the Owner organization role: only an Owner gives an organization token workspace capabilities, and the dialog offers anyone else the preset cut to what they may grant; see [API authentication](/api/authentication).
+- The provider can do what its token's capabilities allow, and nothing more. It reads the token when it starts, and `terraform plan` stops before anything is changed when a resource needs a capability the token lacks, naming the capability.
+
+## Create a token
+
+<Stepper>
+
+1. Open **Settings**, then **API tokens**, and select **Create API token**.
+2. Enter a **Name** that says where the token runs, such as the pipeline's name.
+3. Under **Start from**, choose **Read and write**. It selects every capability under **Capabilities** except the **Users, teams and channels** group, including **Manage integrations**, **Add integrations to workspaces** and **Remove integrations from workspaces**, which `costfluent_workspace_provider` needs. To manage `costfluent_team`, `costfluent_team_member`, `costfluent_team_workspace_access` or `costfluent_app`, or to look a member up with `costfluent_user`, also select the capabilities in that group.
+4. Choose the **Expiration** and select **Create API token**.
+5. Copy the token from **Your API token**. It is shown only once.
+
+</Stepper>
+
+:::caution
+**Read and write** leaves out **Users, teams and channels**, so a token made from it alone is refused when it reads, creates, changes or deletes a `costfluent_team`, `costfluent_team_member`, `costfluent_team_workspace_access` or `costfluent_app`, and when it looks a member up with `costfluent_user`: reading people, teams and channels needs **View members**. Every other resource works with **Read and write**, `costfluent_workspace_provider` included.
+:::
+
+Keep the token out of source control: pass it in the `COSTFLUENT_API_KEY` environment variable, or in a sensitive variable your pipeline fills from its secret store.
+
+## Configure the provider
+
+```hcl
+terraform {
+  required_providers {
+    costfluent = {
+      source  = "costfluent/costfluent"
+      version = "~> 0.5.0"
+    }
+  }
+}
+
+provider "costfluent" {
+  # Every setting is optional here; the environment variables below fill them instead.
+  # api_key   = var.costfluent_api_key
+  # workspace = "wsp_..."
+  # base_url  = "https://api.costfluent.com"
+  # timeout   = 30
+}
+```
+
+Pin the provider to a minor version, as the `version` line above does. Until version 1.0, a new minor version may need changes to your configuration, and the provider's [upgrade guide](https://registry.terraform.io/providers/costfluent/costfluent/latest/docs/guides/upgrade-from-0.2) on the registry lists them for 0.3.0. A patch version never does.
+
+| Setting | Environment variable | What it does |
+|---|---|---|
+| `api_key` | `COSTFLUENT_API_KEY` | The token. Required in one of the two places. |
+| `workspace` | `COSTFLUENT_WORKSPACE` | The workspace ID, starting with `wsp_`, that workspace-scoped resources use when they set no `workspace_id`. |
+| `base_url` | `COSTFLUENT_BASE_URL` | The Public API address. Defaults to `https://api.costfluent.com`. Must use https; plain http is accepted only for `localhost`, `127.0.0.1` and `::1`. |
+| `timeout` | none | How long one request may take, in seconds. Defaults to 30. |
+
+A setting in the provider block wins over its environment variable.
+
+## Connect AWS in the same apply
+
+Each cost-access module creates, in your own cloud account, the read-only access Costfluent needs:
+
+- [`costfluent/cost-access/aws`](https://registry.terraform.io/modules/costfluent/cost-access/aws/latest): the IAM role Costfluent assumes and, in a management account, the cost export it reads.
+- [`costfluent/cost-access/azure`](https://registry.terraform.io/modules/costfluent/cost-access/azure/latest): a service principal with read access to cost data.
+- [`costfluent/cost-access/gcp`](https://registry.terraform.io/modules/costfluent/cost-access/gcp/latest): read access to one billing export.
+
+The modules do not embed the Costfluent provider, so no Costfluent token enters a cloud pipeline unless you add one. Combined with the provider, one apply creates the access and the connection. For AWS:
+
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source = "hashicorp/aws"
+    }
+    costfluent = {
+      source  = "costfluent/costfluent"
+      version = "~> 0.5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+provider "costfluent" {}
+
+# The principal your role must trust, and your organization's external ID.
+data "costfluent_aws_provider_info" "this" {}
+
+module "costfluent_aws" {
+  source  = "costfluent/cost-access/aws"
+  version = "~> 0.4"
+
+  costfluent_principal_arn = data.costfluent_aws_provider_info.this.principal_arn
+  external_id              = data.costfluent_aws_provider_info.this.external_id
+  cost_export_bucket_name  = "acme-costfluent-export" # omit in a member account
+}
+
+resource "costfluent_provider" "aws" {
+  key          = "aws"
+  display_name = "AWS"
+  credentials  = module.costfluent_aws.credentials
+  settings     = module.costfluent_aws.settings
+}
+```
+
+The new connection appears under **Integrations**; choose which workspaces see its cost there ([Manage connections](/connect/manage-connections)). The provider pages cover each cloud in full, with and without Terraform: [AWS](/connect/aws), [Azure](/connect/azure), [Google Cloud](/connect/gcp).
+
+## Manage objects
+
+| Resource | What it manages |
+|---|---|
+| `costfluent_workspace` | A workspace, its currency settings, time zone and automatic syncing |
+| `costfluent_provider` | A connection to a cloud account |
+| `costfluent_workspace_provider` | A connection enabled in a workspace, and which of its accounts the workspace reads |
+| `costfluent_gcp_service_account` | The Google Cloud service account Costfluent runs for your organization |
+| `costfluent_cost_report` | A saved cost report |
+| `costfluent_business_metric` | A business metric a report charts cost per unit of; its values are imported by CSV or the API |
+| `costfluent_folder` | A report folder |
+| `costfluent_dashboard` | A dashboard, and the saved filter its report widgets are read through |
+| `costfluent_dashboard_widget` | A widget on a dashboard: a saved cost report shown as a chart, table or KPI, or text |
+| `costfluent_saved_filter` | A saved filter |
+| `costfluent_savings_view` | A saved view of a workspace's savings queue: a tab and its filters under a title |
+| `costfluent_budget` | A budget and its thresholds |
+| `costfluent_cost_alert` | A cost alert |
+| `costfluent_segment` | A segment |
+| `costfluent_allocation_rule` | An allocation rule |
+| `costfluent_virtual_tag` | A virtual tag |
+| `costfluent_tag_policy` | A workspace's tag policy: the required keys its cost must carry |
+| `costfluent_cost_report_subscription` | A cost report sent to notification channels on a schedule |
+| `costfluent_app` | A notification channel: email, Slack, Microsoft Teams or a webhook |
+| `costfluent_team` | A team |
+| `costfluent_team_member` | A member of the organization in one team, with their role there |
+| `costfluent_team_workspace_access` | A team's access to one workspace, and the dashboard its members open there |
+
+Data sources read workspaces, connections, cost data, cost summaries, anomalies, the findings in a workspace's savings queue (`costfluent_savings_items`), your plan's entitlements, and what an AWS role must trust (`costfluent_aws_provider_info`).
+
+<FeatureStatus feature="CommitmentCoverage" />
+
+`costfluent_commitments` reads the reservations, savings plans and committed use discounts a workspace's connections hold.
+
+A workspace with a report and a budget:
+
+```hcl
+resource "costfluent_workspace" "production" {
+  name     = "Production"
+  currency = "EUR"
+}
+
+resource "costfluent_cost_report" "by_service" {
+  workspace_id  = costfluent_workspace.production.id
+  title         = "Monthly cost by service"
+  date_interval = "ThisMonth"
+  date_bin      = "Day"
+  group_by      = [{ dimension = "ServiceName" }]
+}
+
+resource "costfluent_budget" "monthly" {
+  workspace_id = costfluent_workspace.production.id
+  name         = "Monthly cloud budget"
+  amount       = 10000
+  currency     = "EUR"
+  start_date   = "2026-01-01"
+  alerts = [
+    { threshold_percent = 80 },
+    { threshold_percent = 100 },
+  ]
+}
+```
+
+## Bring existing objects under Terraform
+
+An object made in the product, or through the Public API, can be managed by Terraform without recreating it. Write its `resource` block first, then import it by ID with `terraform import` or an `import` block:
+
+```bash
+terraform import costfluent_cost_report.by_service wsp_1a2b3c:crp_4d5e6f
+```
+
+```hcl
+import {
+  to = costfluent_budget.monthly
+  id = "bud_7g8h9i"
+}
+```
+
+The ID's form depends on the resource:
+
+| Resource | Import ID |
+|---|---|
+| `costfluent_workspace`, `costfluent_provider`, `costfluent_budget`, `costfluent_team`, `costfluent_app` | The object's ID |
+| `costfluent_cost_report`, `costfluent_segment`, `costfluent_allocation_rule`, `costfluent_workspace_provider` | `<workspace ID>:<object ID>`; the workspace is required |
+| `costfluent_cost_alert`, `costfluent_cost_report_subscription`, `costfluent_dashboard`, `costfluent_folder`, `costfluent_saved_filter`, `costfluent_savings_view`, `costfluent_virtual_tag`, `costfluent_business_metric` | `<workspace ID>:<object ID>`, or the object's ID alone, which is then read in the provider's `workspace` |
+| `costfluent_dashboard_widget` | `<workspace ID>:<dashboard ID>:<widget ID>`, or `<dashboard ID>:<widget ID>` in the provider's `workspace` |
+| `costfluent_team_member` | `<team ID>:<user ID>` |
+| `costfluent_team_workspace_access` | `<team ID>:<workspace ID>` |
+| `costfluent_tag_policy` | The workspace's ID: a workspace has one tag policy |
+
+`costfluent_gcp_service_account` cannot be imported, and needs no import: Costfluent creates one service account per organization, and the resource reads it.
+
+The ID of a workspace, connection, cost report, dashboard or budget is the last part of its page's address in the product: `wsp_`, `prv_`, `crp_`, `dsh_` and `bud_` start them. The `costfluent_workspaces` and `costfluent_providers` data sources list workspaces and connections with their IDs, and the Public API's list endpoints return every other object's ID; see the [API reference](/api).
+
+After an import, run `terraform plan`. A difference it shows is between your configuration and the object as it is; change the configuration until the plan is empty, unless you mean to change the object.
+
+## How it behaves
+
+- A change made in the product to an object Terraform manages shows as drift on the next plan. An object deleted in the product is dropped from the state, and the next plan creates it again.
+- `costfluent_provider` retries for up to three minutes while new cloud access propagates, such as a role or a dataset grant made earlier in the same apply. Changing a connection's `display_name` renames it in place: it keeps its ID and the cost it has collected.
+- Destroying a `costfluent_provider` removes the connection, and erases the cost it imported, as [removing it in the product](/connect/manage-connections#remove-a-connection) does.
+- Changing a cost report's `workspace_id` creates the report again in the new workspace.
+- A `costfluent_workspace_provider` without `account_ids`, or with an empty set, reads the whole connection, including accounts it discovers later. Changing `account_ids` or `is_enabled` updates it in place; changing `workspace_id` or `provider_id` creates it again. Creating one or changing its `account_ids` decides which of the organization's accounts the workspace reads, so it needs an organization token with **Manage integrations**, and `terraform plan` refuses a workspace token for it. A workspace token can change `is_enabled` and destroy the resource. Setting `is_enabled = false` stops the workspace reading the connection's cost and anomalies and takes the connection off its automatic schedule, while the link and its `account_ids` stay; `true` restores both. Destroying it stops that workspace reading the connection; the connection, its cost and other workspaces are unaffected.
+- The API never returns a channel's credentials: a webhook's signing secret and a Slack or Microsoft Teams channel's webhook address read back as `***`, and a webhook's `url` as its scheme and host followed by `/***`, such as `https://hooks.example.com/***`. Sending that redacted `url` back keeps the stored one. `costfluent_app` keeps the `config` it applied, so a credential changed in the product does not show as drift, and an imported channel holds the redacted values until the next apply writes the configuration's own. Removing `secret` from a webhook's `config` removes its signing: the provider sends the secret as `null`, because the API keeps the stored secret when an update leaves it out.
+- The Terraform state holds a connection's `credentials`, a channel's `config` and a webhook's `signing_secret` in plaintext. Marking them sensitive only hides them from plan output, so keep the state in an encrypted backend with restricted access.
+- A team's members are `costfluent_team_member` resources; `costfluent_team` manages its name only.
+- A `costfluent_savings_view` keeps a tab of the queue and its filters, as a [saved view](/optimization/savings#saved-views) in the product does. Every change replaces the view whole, so a filter removed from the configuration is cleared. Findings are read-only through Terraform: `costfluent_savings_items` lists them, and a finding is [moved through its states](/optimization/savings#move-a-finding-through-its-states) in the product.
+
+## Related
+
+- [API authentication](/api/authentication)
+- [API reference](/api)
+- [Manage connections](/connect/manage-connections)
+
+
+
+---
+
+## Document: Connect Azure
+
+Give a service principal Cost Management Reader on the subscriptions you want imported, or a billing reader role on your Enterprise Agreement or Microsoft Customer Agreement billing account, and add it to Costfluent as a connection.
+
+URL: /connect/azure
+
+
+# Connect Azure
+
+Costfluent reads Azure cost through a service principal you create. One connection is one service
+principal, and it imports either every subscription that principal can read cost for, or one billing
+scope: the whole bill of an Enterprise Agreement enrollment, or of a Microsoft Customer Agreement
+billing account or billing profile. Several subscriptions do not need several connections. A
+subscription is imported by one connection only, the one that imported it first.
+
+## How Costfluent connects
+
+A connection collects one of two scopes. You choose it when you add the connection, and you can
+switch it later
+([Switching between subscriptions and a billing scope](#switching-between-subscriptions-and-a-billing-scope)):
+
+- **Subscriptions** imports every subscription the principal holds an Azure role on. Charges billed
+  to the billing account rather than to a subscription are missing
+  ([What is not imported](#what-is-not-imported)).
+- **Billing account** imports one billing scope: every subscription billed there, in every
+  directory, and the purchases, tax and credits billed at the billing account or billing profile.
+  It needs a billing reader role on that scope.
+
+To list your reservations and savings plans under
+[Commitments](/optimization/commitments#commitments-held), also assign the service principal
+**Reservations Reader** and **Savings plan Reader**. Both are optional and read only, and Microsoft
+grants them once for the whole Microsoft Entra tenant rather than on a subscription
+([Add the commitment roles](#add-the-commitment-roles)).
+
+### Subscriptions
+
+One built-in role is required, and two are optional:
+
+- **Cost Management Reader** is required. With it, Costfluent lists the subscriptions the principal
+  is assigned to, reads the Cost Details report the import is built on, and reads Azure Advisor's
+  cost recommendations into **Savings** once a day.
+- **Carbon Optimization Reader** is optional. With it, Costfluent reads the emissions Azure reports
+  for the subscription into the [carbon footprint report](/reporting/carbon) once a month. It
+  reads emissions data and nothing else.
+- **Reader** is optional. Costfluent does not use it, and it grants read access to every resource in
+  the subscription. Leave it out unless your own policy asks for it.
+
+None of these roles can change anything in your subscription. Do not grant `Contributor` or `Owner`.
+
+Assign the role per subscription, or once at a management group covering the subscriptions you want
+imported. A management-group assignment also covers subscriptions added to it later.
+
+If a second service principal reaches subscriptions another connection already imports, it still
+connects and imports the rest; the shared ones stay with the first connection. A principal that
+reaches only such subscriptions is refused. To move subscriptions to a new principal, update the
+existing connection's credentials instead of adding a connection.
+
+### Billing scope
+
+The connection's setting `billing_scope` names the scope, in one of three forms:
+
+| Agreement | Scope | `billing_scope` | Role for the service principal |
+|---|---|---|---|
+| Enterprise Agreement | The enrollment | `billingAccounts/<enrollment number>` | Enrollment reader on the billing account |
+| Microsoft Customer Agreement | The billing account | `billingAccounts/<billing account ID>` | Billing account reader on the billing account |
+| Microsoft Customer Agreement | One billing profile | `billingAccounts/<billing account ID>/billingProfiles/<billing profile ID>` | Billing profile reader on the billing profile, or Billing account reader on the billing account |
+
+In the Azure portal, under Cost Management + Billing, a billing account's ID is on its Properties
+page; for an Enterprise Agreement it is the enrollment number. A billing profile's ID is on the
+billing profile's Properties page. Copy the IDs exactly as the portal shows them. Costfluent
+refuses an enrollment's departments and enrollment accounts, a billing profile's invoice sections,
+and management groups: the first three carry usage only, which a subscription connection already
+imports, and Azure's Cost Details report does not serve management groups. Billing through a Cloud
+Solution Provider (CSP) is not supported.
+
+Microsoft documents these billing reader roles as reading the cost of every subscription billed
+under the scope, including subscriptions in other Microsoft Entra directories, and as able to
+create, change and delete budgets and exports in Cost Management as well. Costfluent uses the role
+only to read cost, and creates, changes and deletes nothing in Azure.
+
+Recommendations under **Savings** and the [carbon footprint report](/reporting/carbon) are read per
+subscription, and a billing role does not reach them. For a billing scope, Costfluent reads them for
+each subscription the scope covers, with the roles a subscription connection uses: Cost Management
+Reader for recommendations and Carbon Optimization Reader for emissions, on each subscription or at
+a management group above them. The subscriptions the principal cannot read are reported, as for a
+subscription connection.
+
+A subscription is still imported once. When a billing scope covers a subscription another Azure
+connection of your organization already imports, the billing connection drops that subscription's
+cost, and both connections' pages say so. A subscription connection added later lists the
+subscriptions a billing connection already covers as **Unavailable**. A bill is also imported
+through one connection only: a billing scope that bills part of another connection's billing scope,
+the same enrollment or an MCA billing account and one of its billing profiles, is refused, so its
+purchases, tax and credits are not counted twice. Two billing profiles of one billing account can be
+two connections.
+
+## What is not imported
+
+A connection at subscription scope reads cost per subscription. Charges billed to the billing
+account or billing profile rather than to a subscription are not imported: tax, purchases under a
+Microsoft Customer Agreement (reservations, savings plans and Marketplace bought at the billing
+profile), and other billing-profile charges. Nor are credits and prepayment, such as Azure credit
+offers, sponsorships and prepayment balances: Microsoft applies them on the invoice, at the billing
+account or billing profile, so **Include credits** shows none of them. Your Costfluent totals for
+Azure can therefore be lower than your invoice by those charges, and higher by those credits.
+
+A connection at [billing scope](#billing-scope) imports the purchases, tax and credits billed at the
+billing account or billing profile, beside the cost of every subscription billed there.
+
+## Prerequisites
+
+- The Owner or Integration owner organization role in Costfluent.
+- In Azure, the right to register an application in your Microsoft Entra tenant.
+- For subscriptions, the right to assign roles on the subscriptions or the management group you want
+  imported.
+- For a billing scope, the right to grant its billing role: the enrollment writer role on an
+  Enterprise Agreement enrollment, Billing account owner on a Microsoft Customer Agreement billing
+  account, or Billing profile owner on its billing profile.
+- Optional, for reservations and savings plans on **Commitments**: User Access Administrator at the
+  root of your tenant, which a Global Administrator gets by
+  [elevating access](https://learn.microsoft.com/en-us/azure/role-based-access-control/elevate-access-global-admin)
+  ([Add the commitment roles](#add-the-commitment-roles)).
+- An Enterprise Agreement or a Microsoft Customer Agreement. Azure's Cost Details API, which
+  Costfluent reads, does not serve pay-as-you-go subscriptions on the Microsoft Online Services
+  Program at either scope, and the connection check says so.
+
+## Connect
+
+### Connect with the Azure CLI
+
+Confirm which tenant and subscription you are working in:
+
+```shell
+az account show --query '{tenantId:tenantId,subscriptionId:id,subscriptionName:name}' --output table
+```
+
+Create the service principal. The output contains `appId`, `password` and `tenant`; the password
+cannot be retrieved later, so store it in your password manager now.
+
+```shell
+az ad sp create-for-rbac --name "Costfluent" --output json
+```
+
+Grant it Cost Management Reader, on each subscription you want imported or once at a management
+group. The second command is optional: it grants Carbon Optimization Reader at the same scope, for
+the carbon footprint report.
+
+<CodeTabs>
+
+```shell title="Subscription"
+SUBSCRIPTION_ID="$(az account show --query id --output tsv)"
+APP_ID="<the appId from the previous step>"
+
+az role assignment create --assignee "$APP_ID" \
+  --role "Cost Management Reader" --scope "/subscriptions/$SUBSCRIPTION_ID"
+
+az role assignment create --assignee "$APP_ID" \
+  --role "Carbon Optimization Reader" --scope "/subscriptions/$SUBSCRIPTION_ID"
+```
+
+```shell title="Management group"
+MANAGEMENT_GROUP_ID="<your management group id>"
+APP_ID="<the appId from the previous step>"
+
+az role assignment create --assignee "$APP_ID" \
+  --role "Cost Management Reader" \
+  --scope "/providers/Microsoft.Management/managementGroups/$MANAGEMENT_GROUP_ID"
+
+az role assignment create --assignee "$APP_ID" \
+  --role "Carbon Optimization Reader" \
+  --scope "/providers/Microsoft.Management/managementGroups/$MANAGEMENT_GROUP_ID"
+```
+
+</CodeTabs>
+
+Role assignments take a moment to propagate. An authorization failure immediately after creating
+them is not proof that the credentials are wrong.
+
+Then add the connection in Costfluent:
+
+<Stepper>
+
+1. Open **Settings**, then **Integrations**, and select **Azure**.
+2. Open the **Connect** tab and select **Add service principal**.
+3. Fill in the four fields:
+
+   | Field | Value |
+   |---|---|
+   | **Display name** | Filled in with Microsoft Azure, or Microsoft Azure 2 and up when a connection already has that name; keep it or enter any name, such as Production |
+   | **Microsoft Entra tenant ID** | `tenant` from the service principal |
+   | **Service principal app ID** | `appId` from the service principal |
+   | **Service principal password** | `password` from the service principal |
+
+4. Select **Test connection** to see each check, or **Connect** to save.
+
+</Stepper>
+
+<Framed caption="The Add service principal dialog, opened from the Connect tab.">
+  ![The Add service principal dialog with Display name filled in as Microsoft Azure, the empty Microsoft Entra tenant ID, Service principal app ID and Service principal password fields, each saying where its value comes from, Scope set to Subscriptions, and the Cancel, Test connection and Connect buttons](/screenshots/en/azure-add-account.png)
+</Framed>
+
+There is no subscription field: which subscriptions are imported is decided by the role assignments
+you made, and Costfluent reads that from Azure. Costfluent checks the credentials against the Cost
+Details API before saving them, so a connection that saves can read your cost. If Azure does not
+answer during that check, the connection is saved anyway and checked again automatically.
+
+### Connect at billing scope
+
+Create the service principal with `az ad sp create-for-rbac` as
+[Connect with the Azure CLI](#connect-with-the-azure-cli) shows. Its subscription role assignments
+are needed only for recommendations and carbon ([Billing scope](#billing-scope)). Then grant the
+billing role.
+
+For an Enterprise Agreement, the role is Enrollment reader. A service principal receives it only
+through Azure's billing role assignment API: the Azure portal neither offers it for a service
+principal nor shows the assignment. Run this as a user with the enrollment writer role on the
+enrollment:
+
+```shell
+ENROLLMENT_NUMBER="<your enrollment number>"
+APP_ID="<the appId of the service principal>"
+TENANT_ID="<the tenant of the service principal>"
+PRINCIPAL_ID="$(az ad sp show --id "$APP_ID" --query id --output tsv)"
+ASSIGNMENT_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+
+az rest --method put \
+  --url "https://management.azure.com/providers/Microsoft.Billing/billingAccounts/$ENROLLMENT_NUMBER/billingRoleAssignments/$ASSIGNMENT_ID?api-version=2019-10-01-preview" \
+  --body "{\"properties\": {
+    \"principalId\": \"$PRINCIPAL_ID\",
+    \"principalTenantId\": \"$TENANT_ID\",
+    \"roleDefinitionId\": \"/providers/Microsoft.Billing/billingAccounts/$ENROLLMENT_NUMBER/billingRoleDefinitions/24f8edb6-1668-4659-b5e2-40bb5f3a7d7e\"
+  }}"
+```
+
+`principalId` is the service principal's object ID, the one Microsoft Entra ID lists under
+Enterprise applications, which `az ad sp show` returns. The application's object ID under App
+registrations makes the call fail. `24f8edb6-1668-4659-b5e2-40bb5f3a7d7e` is the Enrollment reader
+role, and a `200 OK` answer means it is assigned.
+
+For a Microsoft Customer Agreement, grant the role in the Azure portal, as you would for a user:
+
+<Stepper>
+
+1. Open Cost Management + Billing and select the billing account, or, for a billing profile scope,
+   the billing profile under Billing profiles.
+2. Select Access control (IAM), then Add.
+3. Choose Billing account reader on the billing account, or Billing profile reader on the billing
+   profile.
+4. Search for the service principal by its name, `Costfluent` if you created it as above, select
+   it, and select Add.
+
+</Stepper>
+
+Then add the connection in Costfluent as
+[Connect with the Azure CLI](#connect-with-the-azure-cli) shows, choosing **Billing account** in the
+**Add service principal** dialog, then your agreement, and entering the IDs. Costfluent checks that the
+principal can read the Cost Details report at the scope before saving it. It finds no subscriptions
+at that point: they appear once their cost arrives ([After connecting](#after-connecting)).
+
+### Add the commitment roles
+
+Optional. With two more roles, Costfluent lists your Azure reservations and savings plans under
+[Commitments](/optimization/commitments#commitments-held). Microsoft grants them not on a
+subscription but once for the whole Microsoft Entra tenant, at a scope of its own:
+
+| Role | Scope | What it reads |
+|---|---|---|
+| **Reservations Reader** | `/providers/Microsoft.Capacity` | Every reservation in the tenant |
+| **Savings plan Reader** | `/providers/Microsoft.BillingBenefits` | Every savings plan in the tenant |
+
+Both are read only: neither can buy, change or cancel a reservation or a savings plan. Assigning a
+role at these scopes needs User Access Administrator at the root of the tenant, which a Global
+Administrator gets by
+[elevating access](https://learn.microsoft.com/en-us/azure/role-based-access-control/elevate-access-global-admin).
+In the Azure portal, only Global Administrators can assign them. Microsoft documents the assignment
+with Azure PowerShell
+([reservations](https://learn.microsoft.com/en-us/azure/cost-management-billing/reservations/manage-reservations-rbac-powershell),
+[savings plans](https://learn.microsoft.com/en-us/azure/cost-management-billing/savings-plan/permission-view-manage)).
+Run it with that access:
+
+```powershell
+Connect-AzAccount -Tenant "<the tenant of the service principal>"
+$PrincipalId = (Get-AzADServicePrincipal -ApplicationId "<the appId of the service principal>").Id
+
+New-AzRoleAssignment -PrincipalId $PrincipalId -RoleDefinitionName "Reservations Reader" -Scope "/providers/Microsoft.Capacity"
+New-AzRoleAssignment -PrincipalId $PrincipalId -RoleDefinitionName "Savings plan Reader" -Scope "/providers/Microsoft.BillingBenefits"
+```
+
+`-PrincipalId` is the service principal's object ID, the one Microsoft Entra ID lists under
+Enterprise applications. The Azure portal does not show assignments made this way;
+`Get-AzRoleAssignment -ObjectId $PrincipalId` lists them. With Terraform, set `commitment_roles = true`
+on the module instead ([Connect with Terraform](#connect-with-terraform)) and apply it with the same
+access. Without the roles, cost and everything else still arrive as before.
+
+### Connect with Terraform
+
+The `costfluent/cost-access/azure` module registers the application, creates its service principal
+and a client secret, and assigns Cost Management Reader and Carbon Optimization Reader on a
+subscription, on any further subscriptions and at any management groups you list, and the two
+commitment roles when you set `commitment_roles`. Its `credentials` output feeds
+`costfluent_provider` directly:
+
+```hcl
+provider "azurerm" {
+  subscription_id = "<subscription to import>"
+  features {}
+}
+
+provider "azuread" {}
+
+module "costfluent_azure" {
+  source  = "costfluent/cost-access/azure"
+  version = "~> 0.4"
+
+  subscription_id = "<subscription to import>"
+
+  # Optional: more subscriptions in the same tenant, and management groups whose subscriptions
+  # inherit the roles, all imported through this one connection.
+  additional_subscription_ids = []
+  management_group_ids        = []
+
+  # Optional: true also assigns the commitment roles for the tenant, which needs elevated access.
+  commitment_roles = false
+}
+
+resource "costfluent_provider" "azure" {
+  key          = "azure"
+  display_name = "Azure"
+  credentials  = module.costfluent_azure.credentials
+}
+```
+
+- **Roles.** `role_definition_names` defaults to Cost Management Reader and Carbon Optimization
+  Reader. Remove Carbon Optimization Reader from it to keep the subscription out of the carbon
+  footprint report. Add `"Reader"` to it only if your policy asks for it.
+- **Several subscriptions.** `additional_subscription_ids` assigns the same roles on more
+  subscriptions in the tenant, and `management_group_ids` at management groups, whose subscriptions
+  inherit them, including ones added later; each is the group's ID, and the tenant root group's ID is
+  the tenant ID. Assigning at a management group needs Owner or User Access Administrator on it.
+  Connecting checks the subscriptions the principal can read within 90 seconds; any it does not reach
+  in that time appear after the next daily check, without a new connection. The module's
+  `assignment_scopes` output lists every scope it assigned the roles on.
+- **Commitment roles.** `commitment_roles = true` also assigns Reservations Reader and Savings plan
+  Reader at their tenant scopes. Only a User Access Administrator at the tenant root can apply it
+  ([Add the commitment roles](#add-the-commitment-roles)); without that access the apply fails on
+  those two assignments.
+- **Billing scope.** The module assigns no billing role. To collect a billing scope, grant the role
+  as [Connect at billing scope](#connect-at-billing-scope) shows, and add
+  `settings = { billing_scope = "billingAccounts/<enrollment number>" }` to `costfluent_provider`,
+  in the form [Billing scope](#billing-scope) gives for your agreement. Removing `settings` switches
+  the connection back to its subscriptions.
+- **Propagation.** `costfluent_provider` does not wait for Azure role assignments to propagate. If
+  the first apply fails because the principal cannot read cost yet, run `terraform apply` again a
+  minute later.
+- **Secret rotation.** The client secret lasts `secret_expiry_days`, 365 by default, until the
+  instant the module's `secret_expires_at` output shows. A module version with the
+  `secret_rotates_at` output replaces it from that instant, `secret_rotation_days_before_expiry`
+  days before expiry (30 by default), so an apply inside that window creates a new secret and passes
+  it to the connection while the old one still works. An earlier version replaces it only at or
+  after expiry, and Costfluent cannot collect from the expiry until that apply runs. An apply
+  outside the window leaves the secret alone. To rotate at any other time, run
+  `terraform apply -replace='module.costfluent_azure.time_rotating.secret'`: it deletes the old
+  secret, creates a new one and passes it to the connection in the same apply.
+
+## Data and freshness
+
+Connecting imports each subscription's cost as far back as your plan's backfill reaches, and at most
+six months ([Manage connections](/connect/manage-connections#how-it-behaves)). A role granted on
+another subscription later needs no new connection: the subscription appears after the next check
+and its first collection reaches back the same way, counted from the day it appears.
+
+A billing scope is imported as far back in the same way. A subscription added to the enrollment or
+billing profile later needs no new role: its cost arrives with the rest of the bill.
+
+:::note
+One day of one subscription, or of the billing scope a connection collects, its actual and
+amortized cost reports together, may hold at most 2,560,000 rows and 4 GiB of cost data. A billing
+scope puts the whole enrollment's or billing profile's day into that one bound. A larger day stops
+the connection with an error that names the day, rather than importing part of it; contact
+Costfluent support through the [contact form](https://costfluent.com/contact).
+:::
+
+### Reservations and savings plans
+
+With the [commitment roles](#add-the-commitment-roles), Costfluent lists the tenant's reservations
+and savings plans under **Commitments held**
+([Commitments](/optimization/commitments#commitments-held)). Azure lists every commitment in the
+tenant, so a connection lists the ones applied to a shared scope or a management group, and the ones
+applied to a single subscription only when the connection imports that subscription.
+
+### Carbon emissions
+
+Azure publishes each month's emissions by the 19th of the next month and serves the last twelve
+months. Costfluent reads them on the 22nd ([Carbon footprint](/reporting/carbon#how-it-behaves)),
+for every subscription the connection imports. Every one of them needs Carbon Optimization Reader:
+when one lacks it, Azure refuses that subscription, and the connection's month is refused as a
+whole rather than shown incomplete. The carbon footprint report then names the subscriptions that
+need the role. Azure states no accounting method for these figures and no service category, so the
+report shows them as **Method not stated** and by resource type.
+
+For a billing scope, these are the subscriptions the scope covers, and the billing role does not
+reach their emissions: grant Carbon Optimization Reader on them, or at a management group above
+them.
+
+## Reporting dimensions
+
+What each group-by dimension of a [cost report](/cost-reports/explore) holds for an Azure
+connection, and the Cost Details column it comes from.
+
+| Dimension | For Azure | From |
+|---|---|---|
+| **Provider** | `azure` | The connection |
+| **Provider name** | `Microsoft Azure`; for a Marketplace charge, the publisher | `PublisherType`, `PublisherName` |
+| **Sub-account** | The subscription's ID; at billing scope, the billing account's ID for a charge billed without a subscription | `SubscriptionId`, else `BillingAccountId` |
+| **Service** | The service, or the meter category when the row names none | `ServiceName`, else `MeterCategory` |
+| **Region** | The resource location's name, such as `West Europe`; `Global` for a charge without one | `ResourceLocation` |
+| **Resource** | The resource's name, or the last segment of its ID | `ResourceName`, else `ResourceId` |
+| **Charge category** | Usage (unused reservations and savings plans included), Purchase (refunds included), Tax or Credit; any other charge type is Adjustment | `ChargeType` |
+| **Service category** | The FOCUS category of the meter category; Cognitive Services, Foundry Models and Azure Machine Learning are AI and Machine Learning | `MeterCategory`, `MeterSubCategory` |
+| **SKU** | The meter's name, such as `gpt-4o-Input-global Tokens` | `MeterName` |
+| **SKU ID** | The meter's ID | `MeterId` |
+| **Resource type** | The resource's type, as Cost Details states it | `ResourceType` |
+| **Product family** | The service family, such as `Compute` or `Storage` | `ServiceFamily` |
+| **Resource group** | The resource group, read from the resource's ID in lower case, so `RG-App` and `rg-app` are one group | `ResourceId` |
+| **Invoice ID** | The invoice the line is billed on | `InvoiceId` |
+| **Invoice issuer** | The partner or reseller that invoices the line; `Microsoft` where none does | `PartnerName`, else `ResellerName` |
+| **Billing period** | The month invoiced, such as `2026-03` | `BillingPeriodStartDate` |
+| **Operation**, **Charge description** | Never filled; Cost Details states neither | |
+| **Tag** | Every key of the row's tags | `Tags` |
+| **Segment** | Your allocation rules | [Segments and allocation rules](/allocation/segments) |
+| **Cluster**, **Namespace** | Never filled; they hold Kubernetes cost ([Connect Kubernetes](/connect/kubernetes)) | |
+| **Virtual tag** | Your virtual tag rules | [Virtual tags](/allocation/virtual-tags) |
+
+An Azure meter billed per thousand or million tokens, unit `1K` or `1M` on a meter named `… Tokens`, has its usage stored as `Tokens`, one by one, so the **Usage** measure sums it with other providers' tokens.
+
+## Update or disconnect
+
+### After connecting
+
+The **Manage** tab lists the connection by its display name, with its tenant ID under **Tenant ID**
+and its **App ID**. Open the gear icon beside it to see whether the credentials still work, which
+workspaces the connection feeds, which billing months have been imported, and a **Subscriptions**
+card listing every subscription the principal reaches with what the connection does with each.
+
+A subscription the principal can see but cannot read cost for, or one another connection already
+imports, is listed as **Unavailable** with the reason, rather than appearing healthy and never
+producing data.
+
+For a billing scope, the page shows the scope the connection collects, and the **Subscriptions**
+card lists the subscriptions the scope's cost has named so far as **Covered**. A subscription whose
+cost another Azure connection already imports is named on both connections' pages, and its cost
+stays with that connection.
+
+**Run checks** on the connection page runs the checks again on request and reports each one
+separately, so a failure names the step that failed: signing in, or reading cost data. The run
+happens in the background, and the page updates itself when it finishes.
+
+### Switching between subscriptions and a billing scope
+
+A connection switches scope in place, and its credentials stay. To switch to a billing scope, grant
+the billing role first ([Connect at billing scope](#connect-at-billing-scope)), then use **Update
+credentials** on the connection page, choose **Billing account**, and enter the IDs. Costfluent
+checks the scope with the stored credentials before storing it, and a refused check changes
+nothing. From then on the connection collects the billing scope and lists each subscription as
+**Covered** once the scope's cost names it. A former subscription the scope does not bill keeps the
+cost already imported for it and is free for another connection. Cost already imported per
+subscription is not counted twice: the billing scope's rows replace the subscriptions' rows of the
+same charges.
+
+To switch back, choose **Subscriptions** the same way, remove `settings` in Terraform, or send
+`clearSettings` to the Public API's `PUT /v1/providers/{providerId}`. The connection then collects
+its subscriptions again and imports their past cost anew, which replaces the billing scope's rows of
+the same charges; the purchases and tax it imported at the billing account stay.
+
+### Rotating or removing the credentials
+
+Reset the service principal's credential in Azure, then use **Update credentials** on the
+connection page. With Terraform, a plain apply rotates the secret only from `secret_rotates_at`
+(at or after expiry on a module version without that output); to rotate it at another time,
+replace the module's timer as
+[Connect with Terraform](#connect-with-terraform) shows, which updates the connection in the same
+apply. To retire the connection, remove it in
+Costfluent and delete the role assignments and the service principal in Azure, or run
+`terraform destroy`. Removing it erases the cost it imported
+([Remove a connection](/connect/manage-connections#remove-a-connection)).
+
+## Troubleshooting
+
+One heading per message, as the connection page shows it: under the connection checks, or as the
+reason beside a subscription on the **Subscriptions** card, where Azure's own words end the reason.
+**Run checks** runs the checks again.
+
+### Costfluent could not authenticate with the Azure credentials.
+
+The tenant ID, app ID or client secret is wrong, or the secret has expired (with Terraform it lasts
+`secret_expiry_days`, 365 by default). Reset the secret in Azure and use **Update credentials** on
+the connection page ([Rotating or removing the credentials](#rotating-or-removing-the-credentials)).
+
+### Costfluent could not read savings recommendations from Azure.
+
+Cost still arrives, and the connection shows as degraded until this is fixed. Azure Advisor refused
+the service principal on the subscription the message beside the check names. Cost Management
+Reader, the role the connection already needs, includes `Microsoft.Advisor/recommendations/read`;
+assign it on that subscription again, or at a management group covering it. Advisor's cost
+recommendations then appear under **Savings** after the next daily read. A billing role does not
+reach Advisor, so a connection at billing scope needs Cost Management Reader on the subscriptions
+the scope covers ([Billing scope](#billing-scope)).
+
+### Costfluent could not list the commitments Azure holds.
+
+Cost still arrives, and the connection stays **Healthy**. Azure refused the list of reservations, of
+savings plans, or both: the service principal lacks Reservations Reader at
+`/providers/Microsoft.Capacity` or Savings plan Reader at `/providers/Microsoft.BillingBenefits`, and
+the message beside the check names which. Both roles are optional; assign them as
+[Add the commitment roles](#add-the-commitment-roles) shows, then **Run checks**. Until then
+**Commitments** names the connection above **Commitments held**.
+
+### Costfluent could not read cost data from Azure.
+
+Signing in worked, but the Cost Details report could not be read. The reason beside each
+subscription on the **Subscriptions** card names the cause, and for a billing scope the reason under
+the check does; the headings below are the usual ones.
+
+### The service principal cannot read Cost Management at this subscription
+
+The principal has no **Cost Management Reader** assignment on the subscription or on a management
+group above it, or the assignment is not in effect yet: role assignments take a moment to
+propagate, and a failure right after creating them is not proof that the credentials are wrong.
+Assign the role ([How Costfluent connects](#how-costfluent-connects)), then **Run checks** a minute
+later; with Terraform, run `terraform apply` again.
+
+### The subscription was not found, or the service principal cannot see it
+
+The subscription ID is wrong, the principal has no assignment on it at all, or the subscription is
+not under an Enterprise Agreement or a Microsoft Customer Agreement: Azure's Cost Details API, which
+Costfluent reads, does not serve pay-as-you-go subscriptions ([Prerequisites](#prerequisites)).
+Azure's own answer ends the reason.
+
+### Azure rejected the Cost Details request for this subscription
+
+Azure accepted the sign-in and knows the subscription, but refuses the Cost Details report for it.
+That is what a pay-as-you-go subscription answers; Azure's own words at the end of the reason tell
+it apart from a mistyped ID.
+
+### The service principal cannot read Cost Management at this enrollment
+
+The connection collects an Enterprise Agreement enrollment, and the principal has no Enrollment
+reader assignment on its billing account. Assign it with the billing role assignment call
+([Connect at billing scope](#connect-at-billing-scope)); the Azure portal does not show this
+assignment, so it is no place to check for it. Then **Run checks**.
+
+### The service principal cannot read Cost Management at this billing scope
+
+The connection collects a Microsoft Customer Agreement billing account or billing profile, and the
+principal holds neither Billing account reader on the billing account nor Billing profile reader on
+the billing profile. Grant one in the Azure portal
+([Connect at billing scope](#connect-at-billing-scope)), then **Run checks**.
+
+### The billing account or billing profile was not found, or the service principal cannot see it
+
+The ID in the scope is wrong, or names a billing account or billing profile the principal holds no
+role on. Compare it with the IDs under Cost Management + Billing in the Azure portal
+([Billing scope](#billing-scope)), and correct it on the connection
+([Switching between subscriptions and a billing scope](#switching-between-subscriptions-and-a-billing-scope)).
+
+### Azure rejected the Cost Details request for this billing scope
+
+Azure accepted the sign-in and knows the scope, but refuses the Cost Details report for it. That is
+what a pay-as-you-go billing account on the Microsoft Online Services Program answers, and
+Costfluent imports such an account at neither scope ([Prerequisites](#prerequisites)).
+
+### Azure subscription … is already collected by another Azure connection in this organization
+
+Another connection's principal already imports the subscription, so this one lists it as
+**Unavailable** and imports the rest; a principal that reaches only such subscriptions is refused.
+Remove the role assignment from one of the two principals, or move the subscriptions by updating
+the existing connection's credentials instead of adding a connection
+([How Costfluent connects](#how-costfluent-connects)).
+
+
+
+---
+
+## Document: Terraform
+
+Costfluent-Objekte mit dem Terraform-Provider als Code verwalten, Cloud-Konten im selben Apply verbinden und im Produkt angelegte Objekte unter Terraform bringen.
+
+URL: /de/developers/terraform
+
+
+# Terraform
+
+Costfluent veröffentlicht einen Terraform-Provider und drei Cost-Access-Module in der öffentlichen Terraform Registry. Die Registry enthält die vollständige Referenz zu jeder Ressource und jeder Eingabe; diese Seite zeigt, wie Sie sie einrichten, wie sie zusammenspielen und wie im Produkt angelegte Objekte unter Terraform kommen.
+
+## Bevor Sie beginnen
+
+<PlanAvailability feature="ApiTokens" plan="Pro" />
+
+- Das Token für den Provider mit der vollständigen Vorlage **Lesen und schreiben** zu erstellen erfordert die Organisationsrolle Eigentümer: Nur ein Eigentümer gibt einem Organisations-Token Workspace-Berechtigungen, und allen anderen bietet der Dialog die Vorlage beschränkt auf das an, was sie vergeben dürfen; siehe [API-Authentifizierung](/de/api/authentication).
+- Der Provider kann, was die Berechtigungen seines Tokens erlauben, und nichts darüber hinaus. Er liest das Token beim Start, und `terraform plan` bricht ab, bevor etwas geändert wird, wenn eine Ressource eine Berechtigung braucht, die dem Token fehlt, und nennt diese Berechtigung.
+
+## Token erstellen
+
+<Stepper>
+
+1. Öffnen Sie **Einstellungen**, dann **API-Token**, und wählen Sie **API-Token erstellen**.
+2. Geben Sie unter **Name** einen Namen ein, der sagt, wo das Token läuft, etwa den Namen der Pipeline.
+3. Wählen Sie unter **Vorlage** die Vorlage **Lesen und schreiben**. Diese Vorlage wählt unter **Berechtigungen** alles außer der Gruppe **Benutzer, Teams und Kanäle**, einschließlich **Integrationen verwalten**, **Integrationen zu Arbeitsbereichen hinzufügen** und **Integrationen aus Arbeitsbereichen entfernen**, die `costfluent_workspace_provider` braucht. Um `costfluent_team`, `costfluent_team_member`, `costfluent_team_workspace_access` oder `costfluent_app` zu verwalten oder ein Mitglied mit `costfluent_user` nachzuschlagen, wählen Sie zusätzlich die Berechtigungen dieser Gruppe.
+4. Wählen Sie den **Ablauf** und dann **API-Token erstellen**.
+5. Kopieren Sie das Token aus **Ihr API-Token**. Es wird nur einmal angezeigt.
+
+</Stepper>
+
+:::caution
+**Lesen und schreiben** lässt **Benutzer, Teams und Kanäle** aus, deshalb wird ein Token allein aus dieser Vorlage abgewiesen, wenn es ein `costfluent_team`, ein `costfluent_team_member`, einen `costfluent_team_workspace_access` oder eine `costfluent_app` liest, anlegt, ändert oder löscht, und wenn es ein Mitglied mit `costfluent_user` nachschlägt: Personen, Teams und Kanäle zu lesen erfordert **Mitglieder anzeigen**. Alle anderen Ressourcen funktionieren mit **Lesen und schreiben**, auch `costfluent_workspace_provider`.
+:::
+
+Halten Sie das Token aus der Versionsverwaltung heraus: Übergeben Sie es in der Umgebungsvariable `COSTFLUENT_API_KEY` oder in einer sensiblen Variable, die Ihre Pipeline aus ihrem Secret-Store füllt.
+
+## Provider konfigurieren
+
+```hcl
+terraform {
+  required_providers {
+    costfluent = {
+      source  = "costfluent/costfluent"
+      version = "~> 0.5.0"
+    }
+  }
+}
+
+provider "costfluent" {
+  # Jede Einstellung ist hier optional; die Umgebungsvariablen unten füllen sie stattdessen.
+  # api_key   = var.costfluent_api_key
+  # workspace = "wsp_..."
+  # base_url  = "https://api.costfluent.com"
+  # timeout   = 30
+}
+```
+
+Legen Sie den Provider auf eine Minor-Version fest, wie es die `version`-Zeile oben tut. Bis Version 1.0 kann eine neue Minor-Version Änderungen an Ihrer Konfiguration erfordern; die [Upgrade-Anleitung](https://registry.terraform.io/providers/costfluent/costfluent/latest/docs/guides/upgrade-from-0.2) des Providers in der Registry nennt sie für 0.3.0. Eine Patch-Version tut das nie.
+
+| Einstellung | Umgebungsvariable | Was sie tut |
+|---|---|---|
+| `api_key` | `COSTFLUENT_API_KEY` | Das Token. An einer der beiden Stellen erforderlich. |
+| `workspace` | `COSTFLUENT_WORKSPACE` | Die Workspace-ID, beginnend mit `wsp_`, die workspace-bezogene Ressourcen ohne eigene `workspace_id` verwenden. |
+| `base_url` | `COSTFLUENT_BASE_URL` | Die Adresse der Public API. Standard ist `https://api.costfluent.com`. Muss https verwenden; einfaches http wird nur für `localhost`, `127.0.0.1` und `::1` akzeptiert. |
+| `timeout` | keine | Wie lange eine Anfrage dauern darf, in Sekunden. Standard ist 30. |
+
+Eine Einstellung im Provider-Block geht ihrer Umgebungsvariable vor.
+
+## AWS im selben Apply verbinden
+
+Jedes Cost-Access-Modul legt in Ihrem eigenen Cloud-Konto den Lesezugriff an, den Costfluent braucht:
+
+- [`costfluent/cost-access/aws`](https://registry.terraform.io/modules/costfluent/cost-access/aws/latest): die IAM-Rolle, die Costfluent übernimmt, und in einem Verwaltungskonto den Kostenexport, den es liest.
+- [`costfluent/cost-access/azure`](https://registry.terraform.io/modules/costfluent/cost-access/azure/latest): einen Service Principal mit Lesezugriff auf Kostendaten.
+- [`costfluent/cost-access/gcp`](https://registry.terraform.io/modules/costfluent/cost-access/gcp/latest): Lesezugriff auf einen Abrechnungsexport.
+
+Die Module enthalten den Costfluent-Provider nicht, sodass kein Costfluent-Token in eine Cloud-Pipeline gelangt, solange Sie keines hinzufügen. Zusammen mit dem Provider legt ein Apply den Zugriff und die Verbindung an. Für AWS:
+
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source = "hashicorp/aws"
+    }
+    costfluent = {
+      source  = "costfluent/costfluent"
+      version = "~> 0.5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+provider "costfluent" {}
+
+# Der Principal, dem Ihre Rolle vertrauen muss, und die External ID Ihrer Organisation.
+data "costfluent_aws_provider_info" "this" {}
+
+module "costfluent_aws" {
+  source  = "costfluent/cost-access/aws"
+  version = "~> 0.4"
+
+  costfluent_principal_arn = data.costfluent_aws_provider_info.this.principal_arn
+  external_id              = data.costfluent_aws_provider_info.this.external_id
+  cost_export_bucket_name  = "acme-costfluent-export" # in einem Mitgliedskonto weglassen
+}
+
+resource "costfluent_provider" "aws" {
+  key          = "aws"
+  display_name = "AWS"
+  credentials  = module.costfluent_aws.credentials
+  settings     = module.costfluent_aws.settings
+}
+```
+
+Die neue Verbindung erscheint unter **Integrationen**; dort legen Sie fest, welche Workspaces ihre Kosten sehen ([Verbindungen verwalten](/de/connect/manage-connections)). Die Provider-Seiten behandeln jede Cloud vollständig, mit und ohne Terraform: [AWS](/de/connect/aws), [Azure](/de/connect/azure), [Google Cloud](/de/connect/gcp).
+
+## Objekte verwalten
+
+| Ressource | Was sie verwaltet |
+|---|---|
+| `costfluent_workspace` | Einen Workspace, seine Währungseinstellungen, seine Zeitzone und die automatische Synchronisierung |
+| `costfluent_provider` | Eine Verbindung zu einem Cloud-Konto |
+| `costfluent_workspace_provider` | Eine in einem Workspace aktivierte Verbindung, und welche ihrer Konten der Workspace liest |
+| `costfluent_gcp_service_account` | Das Google-Cloud-Dienstkonto, das Costfluent für Ihre Organisation betreibt |
+| `costfluent_cost_report` | Einen gespeicherten Kostenbericht |
+| `costfluent_business_metric` | Eine Geschäftskennzahl, deren Kosten pro Einheit ein Bericht zeigt; ihre Werte werden per CSV oder API importiert |
+| `costfluent_folder` | Einen Berichtsordner |
+| `costfluent_dashboard` | Ein Dashboard und der gespeicherte Filter, durch den seine Bericht-Widgets gelesen werden |
+| `costfluent_dashboard_widget` | Ein Widget auf einem Dashboard: ein gespeicherter Kostenbericht als Diagramm, Tabelle oder KPI, oder Text |
+| `costfluent_saved_filter` | Einen gespeicherten Filter |
+| `costfluent_savings_view` | Eine gespeicherte Ansicht der Einsparungsliste eines Workspaces: einen Tab und seine Filter unter einem Titel |
+| `costfluent_budget` | Ein Budget und seine Schwellen |
+| `costfluent_cost_alert` | Eine Kostenwarnung |
+| `costfluent_segment` | Ein Segment |
+| `costfluent_allocation_rule` | Eine Zuordnungsregel |
+| `costfluent_virtual_tag` | Ein virtuelles Tag |
+| `costfluent_tag_policy` | Die Tag-Richtlinie eines Workspaces: die erforderlichen Tag-Schlüssel, die seine Kosten tragen müssen |
+| `costfluent_cost_report_subscription` | Einen Kostenbericht, der nach Zeitplan an Benachrichtigungskanäle gesendet wird |
+| `costfluent_app` | Einen Benachrichtigungskanal: E-Mail, Slack, Microsoft Teams oder ein Webhook |
+| `costfluent_team` | Ein Team |
+| `costfluent_team_member` | Ein Mitglied der Organisation in einem Team, mit seiner Rolle dort |
+| `costfluent_team_workspace_access` | Den Zugriff eines Teams auf einen Workspace und das Dashboard, das seine Mitglieder dort öffnen |
+
+Datenquellen lesen Workspaces, Verbindungen, Kostendaten, Kostenzusammenfassungen, Anomalien, die Potenziale in der Einsparungsliste eines Workspaces (`costfluent_savings_items`), die Berechtigungen Ihres Tarifs und das, wem eine AWS-Rolle vertrauen muss (`costfluent_aws_provider_info`).
+
+<FeatureStatus feature="CommitmentCoverage" />
+
+`costfluent_commitments` liest die Reservierungen, Savings Plans und Committed Use Discounts, die die Verbindungen eines Workspaces halten.
+
+Ein Workspace mit einem Bericht und einem Budget:
+
+```hcl
+resource "costfluent_workspace" "production" {
+  name     = "Production"
+  currency = "EUR"
+}
+
+resource "costfluent_cost_report" "by_service" {
+  workspace_id  = costfluent_workspace.production.id
+  title         = "Monthly cost by service"
+  date_interval = "ThisMonth"
+  date_bin      = "Day"
+  group_by      = [{ dimension = "ServiceName" }]
+}
+
+resource "costfluent_budget" "monthly" {
+  workspace_id = costfluent_workspace.production.id
+  name         = "Monthly cloud budget"
+  amount       = 10000
+  currency     = "EUR"
+  start_date   = "2026-01-01"
+  alerts = [
+    { threshold_percent = 80 },
+    { threshold_percent = 100 },
+  ]
+}
+```
+
+## Bestehende Objekte unter Terraform bringen
+
+Ein im Produkt oder über die Public API angelegtes Objekt kann Terraform verwalten, ohne es neu anzulegen. Schreiben Sie zuerst seinen `resource`-Block und importieren Sie es dann per ID mit `terraform import` oder einem `import`-Block:
+
+```bash
+terraform import costfluent_cost_report.by_service wsp_1a2b3c:crp_4d5e6f
+```
+
+```hcl
+import {
+  to = costfluent_budget.monthly
+  id = "bud_7g8h9i"
+}
+```
+
+Die Form der ID hängt von der Ressource ab:
+
+| Ressource | Import-ID |
+|---|---|
+| `costfluent_workspace`, `costfluent_provider`, `costfluent_budget`, `costfluent_team`, `costfluent_app` | Die ID des Objekts |
+| `costfluent_cost_report`, `costfluent_segment`, `costfluent_allocation_rule`, `costfluent_workspace_provider` | `<Workspace-ID>:<Objekt-ID>`; der Workspace ist erforderlich |
+| `costfluent_cost_alert`, `costfluent_cost_report_subscription`, `costfluent_dashboard`, `costfluent_folder`, `costfluent_saved_filter`, `costfluent_savings_view`, `costfluent_virtual_tag`, `costfluent_business_metric` | `<Workspace-ID>:<Objekt-ID>`, oder die ID des Objekts allein, das dann im `workspace` des Providers gelesen wird |
+| `costfluent_dashboard_widget` | `<Workspace-ID>:<Dashboard-ID>:<Widget-ID>`, oder `<Dashboard-ID>:<Widget-ID>` im `workspace` des Providers |
+| `costfluent_team_member` | `<Team-ID>:<Benutzer-ID>` |
+| `costfluent_team_workspace_access` | `<Team-ID>:<Workspace-ID>` |
+| `costfluent_tag_policy` | Die ID des Workspaces: Ein Workspace hat eine Tag-Richtlinie |
+
+`costfluent_gcp_service_account` lässt sich nicht importieren und braucht keinen Import: Costfluent legt ein Dienstkonto pro Organisation an, und die Ressource liest es.
+
+Die ID eines Workspace, einer Verbindung, eines Kostenberichts, eines Dashboards oder eines Budgets ist der letzte Teil der Adresse seiner Seite im Produkt: Die ID beginnt mit `wsp_`, `prv_`, `crp_`, `dsh_` oder `bud_`. Die Datenquellen `costfluent_workspaces` und `costfluent_providers` listen Workspaces und Verbindungen mit ihren IDs, und die Listen-Endpunkte der Public API liefern die ID jedes anderen Objekts; siehe die [API-Referenz](/api).
+
+Führen Sie nach einem Import `terraform plan` aus. Ein Unterschied, den der Plan zeigt, besteht zwischen Ihrer Konfiguration und dem Objekt, wie es ist; passen Sie die Konfiguration an, bis der Plan leer ist, es sei denn, Sie wollen das Objekt ändern.
+
+## Wie es sich verhält
+
+- Eine Änderung im Produkt an einem von Terraform verwalteten Objekt erscheint beim nächsten Plan als Drift. Ein im Produkt gelöschtes Objekt fällt aus dem State, und der nächste Plan legt es wieder an.
+- `costfluent_provider` versucht es bis zu drei Minuten erneut, während sich neuer Cloud-Zugriff verbreitet, etwa eine Rolle oder eine Dataset-Freigabe, die früher im selben Apply angelegt wurde. Eine Änderung am `display_name` einer Verbindung benennt sie an Ort und Stelle um: Die Verbindung behält ihre ID und die Kosten, die sie erfasst hat.
+- Ein `costfluent_provider` zu zerstören entfernt die Verbindung und löscht die von ihr importierten Kosten, wie [das Entfernen im Produkt](/de/connect/manage-connections#verbindung-entfernen).
+- Eine Änderung der `workspace_id` eines Kostenberichts legt den Bericht im neuen Workspace neu an.
+- Ein `costfluent_workspace_provider` ohne `account_ids` oder mit einer leeren Menge liest die gesamte Verbindung, einschließlich später erkannter Konten. Eine Änderung von `account_ids` oder `is_enabled` aktualisiert ihn an Ort und Stelle; eine Änderung von `workspace_id` oder `provider_id` legt ihn neu an. Ihn anzulegen oder seine `account_ids` zu ändern entscheidet, welche Konten der Organisation der Workspace liest, deshalb braucht es ein Organisations-Token mit **Integrationen verwalten**, und `terraform plan` lehnt dafür ein Workspace-Token ab. Ein Workspace-Token kann `is_enabled` ändern und die Ressource zerstören. Mit `is_enabled = false` liest der Workspace die Kosten und Anomalien der Verbindung nicht mehr, und die Verbindung verlässt seinen automatischen Zeitplan; die Verknüpfung und ihre `account_ids` bleiben, und `true` stellt beides wieder her. Ihn zu zerstören beendet, dass dieser Workspace die Verbindung liest; die Verbindung, ihre Kosten und andere Workspaces bleiben unberührt.
+- Die API gibt die Zugangsdaten eines Kanals nie zurück: das Signatur-Secret eines Webhooks und die Webhook-Adresse eines Slack- oder Microsoft-Teams-Kanals werden als `***` gelesen, die `url` eines Webhooks als Schema und Host mit `/***`, etwa `https://hooks.example.com/***`. Wird diese gekürzte `url` zurückgesendet, bleibt die gespeicherte erhalten. `costfluent_app` behält die angewendete `config`, deshalb erscheint ein im Produkt geänderter Zugangswert nicht als Drift, und ein importierter Kanal hält die gekürzten Werte, bis der nächste Apply die eigene Konfiguration schreibt. Wenn Sie `secret` aus der `config` eines Webhooks entfernen, wird er nicht mehr signiert: Der Provider sendet das Secret als `null`, weil die API das gespeicherte Secret behält, wenn eine Änderung es weglässt.
+- Der Terraform-State enthält die `credentials` einer Verbindung, die `config` eines Kanals und das `signing_secret` eines Webhooks im Klartext. Als sensibel markiert werden sie nur in der Plan-Ausgabe verborgen; legen Sie den State deshalb in einem verschlüsselten Backend mit eingeschränktem Zugriff ab.
+- Die Mitglieder eines Teams sind `costfluent_team_member`-Ressourcen; `costfluent_team` verwaltet nur seinen Namen.
+- Eine `costfluent_savings_view` hält einen Tab der Liste und seine Filter fest, wie eine [gespeicherte Ansicht](/de/optimization/savings#gespeicherte-ansichten) im Produkt. Jede Änderung ersetzt die Ansicht vollständig, daher fällt ein Filter, den Sie aus der Konfiguration entfernen, auch in der Ansicht weg. Potenziale liest Terraform nur: `costfluent_savings_items` listet sie, und im Produkt [führen Sie ein Potenzial durch seine Status](/de/optimization/savings#ein-potenzial-durch-seine-status-führen).
+
+## Verwandte Seiten
+
+- [API-Authentifizierung](/de/api/authentication)
+- [API-Referenz](/api)
+- [Verbindungen verwalten](/de/connect/manage-connections)
+
+
+
+---
+
+## Document: Azure verbinden
+
+Geben Sie einem Dienstprinzipal Cost Management Reader auf den Abonnements, die importiert werden sollen, oder eine Leserolle auf Ihrem Abrechnungskonto mit Enterprise Agreement oder Microsoft Customer Agreement, und fügen Sie ihn Costfluent als Verbindung hinzu.
+
+URL: /de/connect/azure
+
+
+# Azure verbinden
+
+Costfluent liest Azure-Kosten über einen Dienstprinzipal, den Sie erstellen. Eine Verbindung ist ein
+Dienstprinzipal und importiert entweder jedes Abonnement, dessen Kosten dieser Prinzipal lesen darf,
+oder einen Abrechnungsbereich: die ganze Rechnung einer Enterprise-Agreement-Registrierung oder
+eines Abrechnungskontos oder Abrechnungsprofils unter einem Microsoft Customer Agreement. Mehrere
+Abonnements brauchen also keine mehreren Verbindungen. Ein Abonnement importiert nur eine
+Verbindung, und zwar die, die es zuerst importiert hat.
+
+## Wie Costfluent verbindet
+
+Eine Verbindung erfasst einen von zwei Bereichen. Diesen wählen Sie beim Hinzufügen der Verbindung und
+können ihn später wechseln
+([Zwischen Abonnements und Abrechnungsbereich wechseln](#zwischen-abonnements-und-abrechnungsbereich-wechseln)):
+
+- **Abonnements** importiert jedes Abonnement, auf dem der Prinzipal eine Azure-Rolle hat. Gebühren,
+  die dem Abrechnungskonto statt einem Abonnement berechnet werden, fehlen
+  ([Was nicht importiert wird](#was-nicht-importiert-wird)).
+- **Abrechnungskonto** importiert einen Abrechnungsbereich: jedes dort abgerechnete Abonnement, in
+  jedem Verzeichnis, dazu die Käufe, Steuern und Gutschriften, die dem Abrechnungskonto oder
+  Abrechnungsprofil berechnet werden. Dafür braucht der Prinzipal eine Leserolle der Abrechnung auf
+  diesem Bereich.
+
+Damit Ihre Reservierungen und Sparpläne unter
+[Commitments](/de/optimization/commitments#gehaltene-commitments) erscheinen, weisen Sie dem
+Dienstprinzipal außerdem **Reservations Reader** und **Savings plan Reader** zu. Beide sind optional
+und nur lesend, und Microsoft vergibt sie einmal für den ganzen Microsoft-Entra-Mandanten statt auf
+einem Abonnement ([Commitment-Rollen vergeben](#commitment-rollen-vergeben)).
+
+### Abonnements
+
+Eine integrierte Rolle ist erforderlich, zwei sind optional:
+
+- **Cost Management Reader** ist erforderlich. Damit listet Costfluent die Abonnements, denen der
+  Prinzipal zugewiesen ist, liest den Cost-Details-Bericht, auf dem der Import aufbaut, und liest
+  einmal täglich die Kostenempfehlungen von Azure Advisor nach **Einsparungen**.
+- **Carbon Optimization Reader** ist optional. Damit liest Costfluent einmal im Monat die
+  Emissionen, die Azure für das Abonnement meldet, in den
+  [Bericht zum CO2-Fußabdruck](/de/reporting/carbon). Die Rolle liest Emissionsdaten und sonst
+  nichts.
+- **Reader** ist optional. Costfluent nutzt die Rolle nicht, und sie gewährt Lesezugriff auf jede
+  Ressource im Abonnement. Lassen Sie sie weg, solange Ihre eigenen Richtlinien sie nicht verlangen.
+
+Keine der Rollen kann etwas in Ihrem Abonnement ändern. Vergeben Sie weder `Contributor` noch `Owner`.
+
+Weisen Sie die Rolle je Abonnement zu oder einmalig auf einer Verwaltungsgruppe, die die zu
+importierenden Abonnements umfasst. Eine Zuweisung auf Verwaltungsgruppenebene deckt auch später hinzugefügte
+Abonnements ab.
+
+Erreicht ein zweiter Dienstprinzipal Abonnements, die bereits eine andere Verbindung importiert,
+wird er trotzdem verbunden und importiert die übrigen; die gemeinsamen bleiben bei der ersten
+Verbindung. Ein Prinzipal, der nur solche Abonnements erreicht, wird abgelehnt. Um Abonnements auf
+einen neuen Prinzipal zu übertragen, aktualisieren Sie die Zugangsdaten der bestehenden Verbindung, statt
+eine neue hinzuzufügen.
+
+### Abrechnungsbereich
+
+Die Einstellung `billing_scope` der Verbindung nennt den Bereich, in einer von drei Formen:
+
+| Vertrag | Bereich | `billing_scope` | Rolle für den Dienstprinzipal |
+|---|---|---|---|
+| Enterprise Agreement | Die Registrierung | `billingAccounts/<Registrierungsnummer>` | Enrollment reader auf dem Abrechnungskonto |
+| Microsoft Customer Agreement | Das Abrechnungskonto | `billingAccounts/<Abrechnungskonto-ID>` | Billing account reader auf dem Abrechnungskonto |
+| Microsoft Customer Agreement | Ein Abrechnungsprofil | `billingAccounts/<Abrechnungskonto-ID>/billingProfiles/<Abrechnungsprofil-ID>` | Billing profile reader auf dem Abrechnungsprofil oder Billing account reader auf dem Abrechnungskonto |
+
+Im Azure-Portal steht unter Kostenverwaltung + Abrechnung die ID eines Abrechnungskontos auf seiner
+Seite Eigenschaften; bei einem Enterprise Agreement ist es die Registrierungsnummer. Die ID eines
+Abrechnungsprofils steht auf der Seite Eigenschaften des Abrechnungsprofils. Übernehmen Sie die IDs
+genau so, wie das Portal sie zeigt. Costfluent lehnt Abteilungen und Registrierungskonten einer
+Registrierung, Rechnungsabschnitte eines Abrechnungsprofils und Verwaltungsgruppen ab: Die ersten
+drei enthalten nur Nutzung, die eine Abonnement-Verbindung ohnehin importiert, und den
+Cost-Details-Bericht von Azure gibt es für Verwaltungsgruppen nicht. Abrechnung über einen Cloud
+Solution Provider (CSP) wird nicht unterstützt.
+
+Laut Microsoft lesen diese Leserollen der Abrechnung die Kosten jedes Abonnements, das unter dem
+Bereich abgerechnet wird, auch in anderen Microsoft-Entra-Verzeichnissen, und dürfen in Cost
+Management zusätzlich Budgets und Exporte anlegen, ändern und löschen. Costfluent nutzt die Rolle
+nur zum Lesen von Kosten und legt in Azure nichts an, ändert nichts und löscht nichts.
+
+Empfehlungen unter **Einsparungen** und der [Bericht zum CO2-Fußabdruck](/de/reporting/carbon)
+werden je Abonnement gelesen, und eine Rolle der Abrechnung reicht nicht bis dorthin. Bei einem
+Abrechnungsbereich liest Costfluent sie für jedes Abonnement, das der Bereich umfasst, mit den
+Rollen, die auch eine Abonnement-Verbindung nutzt: Cost Management Reader für Empfehlungen und
+Carbon Optimization Reader für Emissionen, auf jedem Abonnement oder auf einer Verwaltungsgruppe
+darüber. Die Abonnements, die der Prinzipal nicht lesen kann, werden gemeldet, wie bei einer
+Abonnement-Verbindung.
+
+Ein Abonnement wird auch hier nur einmal importiert. Umfasst ein Abrechnungsbereich ein Abonnement,
+das bereits eine andere Azure-Verbindung Ihrer Organisation importiert, verwirft die Verbindung
+des Abrechnungsbereichs die Kosten dieses Abonnements, und die Seiten beider Verbindungen sagen das.
+Eine später hinzugefügte Abonnement-Verbindung listet die Abonnements, die bereits ein
+Abrechnungsbereich umfasst, als **Nicht verfügbar**. Auch eine Rechnung wird nur über eine
+Verbindung importiert: Ein Abrechnungsbereich, der einen Teil des Abrechnungsbereichs einer anderen
+Verbindung abrechnet, also dieselbe Registrierung oder ein MCA-Abrechnungskonto und eines seiner
+Abrechnungsprofile, wird abgelehnt, damit seine Käufe, Steuern und Gutschriften nicht doppelt zählen.
+Zwei Abrechnungsprofile eines Abrechnungskontos können zwei Verbindungen sein.
+
+## Was nicht importiert wird
+
+Eine Verbindung auf Abonnementebene liest Kosten je Abonnement. Gebühren, die dem Abrechnungskonto
+oder dem Abrechnungsprofil statt einem Abonnement berechnet werden, werden nicht importiert:
+Steuern, Käufe unter einem Microsoft Customer Agreement (Reservierungen, Sparpläne und
+Marketplace-Käufe auf dem Abrechnungsprofil) und andere Gebühren des Abrechnungsprofils. Ebenso
+wenig Gutschriften und Vorauszahlungen, etwa Azure-Guthabenangebote, Sponsorings und
+Vorauszahlungsguthaben: Microsoft verrechnet sie auf der Rechnung, beim Abrechnungskonto oder
+Abrechnungsprofil, daher zeigt **Gutschriften einbeziehen** keine davon. Ihre Azure-Summen in
+Costfluent können deshalb um diese Gebühren unter und um diese Gutschriften über Ihrer Rechnung
+liegen.
+
+Eine Verbindung im [Abrechnungsbereich](#abrechnungsbereich) importiert die Käufe, Steuern und
+Gutschriften, die dem Abrechnungskonto oder Abrechnungsprofil berechnet werden, neben den Kosten
+jedes dort abgerechneten Abonnements.
+
+## Voraussetzungen
+
+- Die Organisationsrolle Eigentümer oder Integrationsverantwortliche Person in Costfluent.
+- In Azure das Recht, in Ihrem Microsoft-Entra-Mandanten eine Anwendung zu registrieren.
+- Für Abonnements das Recht, auf den Abonnements oder der Verwaltungsgruppe, die importiert werden
+  sollen, Rollen zuzuweisen.
+- Für einen Abrechnungsbereich das Recht, seine Rolle der Abrechnung zu vergeben: die Rolle
+  enrollment writer auf einer Enterprise-Agreement-Registrierung, Billing account owner auf einem
+  Abrechnungskonto unter einem Microsoft Customer Agreement oder Billing profile owner auf dessen
+  Abrechnungsprofil.
+- Optional, für Reservierungen und Sparpläne unter **Commitments**: User Access Administrator auf der
+  Stammebene Ihres Mandanten, die eine Person mit der Rolle Global Administrator durch
+  [Erhöhen des Zugriffs](https://learn.microsoft.com/de-de/azure/role-based-access-control/elevate-access-global-admin)
+  erhält ([Commitment-Rollen vergeben](#commitment-rollen-vergeben)).
+- Ein Enterprise Agreement oder ein Microsoft Customer Agreement. Die Cost Details API von Azure,
+  die Costfluent liest, bedient Pay-as-you-go-Abonnements im Microsoft Online Services Program in
+  keinem der beiden Bereiche, und die Verbindungsprüfung sagt das.
+
+## Verbinden
+
+### Mit der Azure CLI verbinden
+
+Prüfen Sie, in welchem Mandanten und Abonnement Sie arbeiten:
+
+```shell
+az account show --query '{tenantId:tenantId,subscriptionId:id,subscriptionName:name}' --output table
+```
+
+Erstellen Sie den Dienstprinzipal. Die Ausgabe enthält `appId`, `password` und `tenant`. Das Passwort
+lässt sich später nicht erneut abrufen, speichern Sie es also jetzt in Ihrem Passwortmanager.
+
+```shell
+az ad sp create-for-rbac --name "Costfluent" --output json
+```
+
+Vergeben Sie ihm Cost Management Reader, auf jedem Abonnement, das importiert werden soll, oder einmalig
+auf einer Verwaltungsgruppe. Der zweite Befehl ist optional: Er vergibt Carbon Optimization Reader
+auf derselben Ebene, für den Bericht zum CO2-Fußabdruck.
+
+<CodeTabs>
+
+```shell title="Abonnement"
+SUBSCRIPTION_ID="$(az account show --query id --output tsv)"
+APP_ID="<die appId aus dem vorherigen Schritt>"
+
+az role assignment create --assignee "$APP_ID" \
+  --role "Cost Management Reader" --scope "/subscriptions/$SUBSCRIPTION_ID"
+
+az role assignment create --assignee "$APP_ID" \
+  --role "Carbon Optimization Reader" --scope "/subscriptions/$SUBSCRIPTION_ID"
+```
+
+```shell title="Verwaltungsgruppe"
+MANAGEMENT_GROUP_ID="<Ihre Verwaltungsgruppen-ID>"
+APP_ID="<die appId aus dem vorherigen Schritt>"
+
+az role assignment create --assignee "$APP_ID" \
+  --role "Cost Management Reader" \
+  --scope "/providers/Microsoft.Management/managementGroups/$MANAGEMENT_GROUP_ID"
+
+az role assignment create --assignee "$APP_ID" \
+  --role "Carbon Optimization Reader" \
+  --scope "/providers/Microsoft.Management/managementGroups/$MANAGEMENT_GROUP_ID"
+```
+
+</CodeTabs>
+
+Rollenzuweisungen brauchen einen Moment, bis sie wirksam sind. Ein Autorisierungsfehler unmittelbar
+danach bedeutet nicht, dass die Zugangsdaten falsch sind.
+
+Fügen Sie dann die Verbindung in Costfluent hinzu:
+
+<Stepper>
+
+1. Öffnen Sie **Einstellungen**, dann **Integrationen**, und wählen Sie **Azure**.
+2. Öffnen Sie den Tab **Verbinden** und wählen Sie **Dienstprinzipal hinzufügen**.
+3. Füllen Sie die vier Felder aus:
+
+   | Feld | Wert |
+   |---|---|
+   | **Anzeigename** | Vorausgefüllt mit Microsoft Azure, oder mit Microsoft Azure 2 und höher, wenn eine Verbindung schon so heißt; übernehmen Sie ihn oder geben Sie einen beliebigen Namen ein, etwa Production |
+   | **Microsoft-Entra-Mandanten-ID** | `tenant` des Dienstprinzipals |
+   | **App-ID des Dienstprinzipals** | `appId` des Dienstprinzipals |
+   | **Kennwort des Dienstprinzipals** | `password` des Dienstprinzipals |
+
+4. Wählen Sie **Verbindung testen**, um jede Prüfung zu sehen, oder **Verbinden**, um zu speichern.
+
+</Stepper>
+
+<Framed caption="Der Dialog Dienstprinzipal hinzufügen, geöffnet aus dem Tab Verbinden.">
+  ![Der Dialog Dienstprinzipal hinzufügen mit dem Anzeigename Microsoft Azure, den leeren Feldern Microsoft-Entra-Mandanten-ID, App-ID des Dienstprinzipals und Kennwort des Dienstprinzipals, die jeweils sagen, woher ihr Wert kommt, dem Bereich Abonnements sowie den Schaltflächen Abbrechen, Verbindung testen und Verbinden](/screenshots/de/azure-add-account.png)
+</Framed>
+
+Es gibt kein Abonnementfeld: Welche Abonnements importiert werden, entscheiden Ihre
+Rollenzuweisungen, und Costfluent liest das aus Azure. Costfluent prüft die Zugangsdaten vor dem
+Speichern gegen die Cost-Details-API. Eine Verbindung, die gespeichert wird, kann Ihre Kosten also
+lesen. Antwortet Azure bei dieser Prüfung nicht, wird die Verbindung trotzdem gespeichert und
+automatisch erneut geprüft.
+
+### Im Abrechnungsbereich verbinden
+
+Erstellen Sie den Dienstprinzipal mit `az ad sp create-for-rbac`, wie
+[Mit der Azure CLI verbinden](#mit-der-azure-cli-verbinden) zeigt. Seine Rollenzuweisungen auf
+Abonnements braucht es nur für Empfehlungen und CO2-Emissionen
+([Abrechnungsbereich](#abrechnungsbereich)). Vergeben Sie ihm dann die Rolle der Abrechnung.
+
+Bei einem Enterprise Agreement ist das die Rolle Enrollment reader. Ein Dienstprinzipal erhält sie
+nur über die API für Rollenzuweisungen der Abrechnung von Azure: Das Azure-Portal bietet sie für
+einen Dienstprinzipal nicht an und zeigt die Zuweisung auch nicht. Führen Sie Folgendes als Person
+mit der Rolle enrollment writer auf der Registrierung aus:
+
+```shell
+ENROLLMENT_NUMBER="<Ihre Registrierungsnummer>"
+APP_ID="<die appId des Dienstprinzipals>"
+TENANT_ID="<der tenant des Dienstprinzipals>"
+PRINCIPAL_ID="$(az ad sp show --id "$APP_ID" --query id --output tsv)"
+ASSIGNMENT_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+
+az rest --method put \
+  --url "https://management.azure.com/providers/Microsoft.Billing/billingAccounts/$ENROLLMENT_NUMBER/billingRoleAssignments/$ASSIGNMENT_ID?api-version=2019-10-01-preview" \
+  --body "{\"properties\": {
+    \"principalId\": \"$PRINCIPAL_ID\",
+    \"principalTenantId\": \"$TENANT_ID\",
+    \"roleDefinitionId\": \"/providers/Microsoft.Billing/billingAccounts/$ENROLLMENT_NUMBER/billingRoleDefinitions/24f8edb6-1668-4659-b5e2-40bb5f3a7d7e\"
+  }}"
+```
+
+`principalId` ist die Objekt-ID des Dienstprinzipals, die Microsoft Entra ID unter
+Unternehmensanwendungen zeigt und die `az ad sp show` zurückgibt. Mit der Objekt-ID der Anwendung
+unter App-Registrierungen schlägt der Aufruf fehl. `24f8edb6-1668-4659-b5e2-40bb5f3a7d7e` ist die
+Rolle Enrollment reader, und die Antwort `200 OK` bedeutet, dass sie zugewiesen ist.
+
+Bei einem Microsoft Customer Agreement vergeben Sie die Rolle im Azure-Portal, wie für eine Person:
+
+<Stepper>
+
+1. Öffnen Sie Kostenverwaltung + Abrechnung und wählen Sie das Abrechnungskonto oder, für ein
+   Abrechnungsprofil als Bereich, das Abrechnungsprofil unter Abrechnungsprofile.
+2. Wählen Sie Zugriffssteuerung (IAM), dann Hinzufügen.
+3. Wählen Sie Billing account reader auf dem Abrechnungskonto oder Billing profile reader auf dem
+   Abrechnungsprofil.
+4. Suchen Sie den Dienstprinzipal über seinen Namen, `Costfluent`, wenn Sie ihn wie oben erstellt
+   haben, wählen Sie ihn aus und wählen Sie Hinzufügen.
+
+</Stepper>
+
+Fügen Sie die Verbindung dann in Costfluent hinzu, wie
+[Mit der Azure CLI verbinden](#mit-der-azure-cli-verbinden) zeigt: Wählen Sie im Dialog
+**Dienstprinzipal hinzufügen** die Option **Abrechnungskonto**, dann Ihren Vertrag, und geben Sie die IDs ein. Costfluent
+prüft vor dem Speichern, ob der Prinzipal den Cost-Details-Bericht im Bereich lesen kann. Abonnements
+findet es dabei noch keine: Die Abonnements erscheinen, sobald ihre Kosten ankommen
+([Nach dem Verbinden](#nach-dem-verbinden)).
+
+### Commitment-Rollen vergeben
+
+Optional. Mit zwei weiteren Rollen listet Costfluent Ihre Azure-Reservierungen und -Sparpläne unter
+[Commitments](/de/optimization/commitments#gehaltene-commitments). Microsoft vergibt sie nicht auf
+einem Abonnement, sondern einmal für den ganzen Microsoft-Entra-Mandanten, auf einer eigenen Ebene:
+
+| Rolle | Bereich | Was sie liest |
+|---|---|---|
+| **Reservations Reader** | `/providers/Microsoft.Capacity` | Jede Reservierung im Mandanten |
+| **Savings plan Reader** | `/providers/Microsoft.BillingBenefits` | Jeden Sparplan im Mandanten |
+
+Beide sind nur lesend: Keine von beiden kann eine Reservierung oder einen Sparplan kaufen, ändern
+oder kündigen. Um eine Rolle auf diesen Ebenen zuzuweisen, brauchen Sie User Access Administrator auf
+der Stammebene des Mandanten, die eine Person mit der Rolle Global Administrator durch
+[Erhöhen des Zugriffs](https://learn.microsoft.com/de-de/azure/role-based-access-control/elevate-access-global-admin)
+erhält. Im Azure-Portal können nur Personen mit der Rolle Global Administrator sie zuweisen.
+Microsoft beschreibt die Zuweisung mit Azure PowerShell
+([Reservierungen](https://learn.microsoft.com/de-de/azure/cost-management-billing/reservations/manage-reservations-rbac-powershell),
+[Sparpläne](https://learn.microsoft.com/de-de/azure/cost-management-billing/savings-plan/permission-view-manage)).
+Führen Sie sie mit diesem Zugriff aus:
+
+```powershell
+Connect-AzAccount -Tenant "<der tenant des Dienstprinzipals>"
+$PrincipalId = (Get-AzADServicePrincipal -ApplicationId "<die appId des Dienstprinzipals>").Id
+
+New-AzRoleAssignment -PrincipalId $PrincipalId -RoleDefinitionName "Reservations Reader" -Scope "/providers/Microsoft.Capacity"
+New-AzRoleAssignment -PrincipalId $PrincipalId -RoleDefinitionName "Savings plan Reader" -Scope "/providers/Microsoft.BillingBenefits"
+```
+
+`-PrincipalId` ist die Objekt-ID des Dienstprinzipals, die Microsoft Entra ID unter
+Unternehmensanwendungen zeigt. Das Azure-Portal zeigt so erstellte Zuweisungen nicht an;
+`Get-AzRoleAssignment -ObjectId $PrincipalId` listet sie. Mit Terraform setzen Sie stattdessen
+`commitment_roles = true` am Modul ([Mit Terraform verbinden](#mit-terraform-verbinden)) und führen
+das Apply mit demselben Zugriff aus. Ohne die Rollen kommen Kosten und alles andere weiterhin an
+wie bisher.
+
+### Mit Terraform verbinden
+
+Das Modul `costfluent/cost-access/azure` registriert die Anwendung, erstellt ihren Dienstprinzipal
+und ein Client-Secret und weist Cost Management Reader und Carbon Optimization Reader auf einem
+Abonnement, auf weiteren Abonnements und auf Verwaltungsgruppen zu, die Sie angeben, und die beiden
+Commitment-Rollen, wenn Sie `commitment_roles` setzen. Seine Ausgabe `credentials` speist
+`costfluent_provider` direkt:
+
+```hcl
+provider "azurerm" {
+  subscription_id = "<zu importierendes Abonnement>"
+  features {}
+}
+
+provider "azuread" {}
+
+module "costfluent_azure" {
+  source  = "costfluent/cost-access/azure"
+  version = "~> 0.4"
+
+  subscription_id = "<zu importierendes Abonnement>"
+
+  # Optional: weitere Abonnements im selben Mandanten und Verwaltungsgruppen, deren Abonnements die
+  # Rollen erben, alle über diese eine Verbindung importiert.
+  additional_subscription_ids = []
+  management_group_ids        = []
+
+  # Optional: true vergibt auch die Commitment-Rollen für den Mandanten, was erhöhten Zugriff braucht.
+  commitment_roles = false
+}
+
+resource "costfluent_provider" "azure" {
+  key          = "azure"
+  display_name = "Azure"
+  credentials  = module.costfluent_azure.credentials
+}
+```
+
+- **Rollen.** `role_definition_names` steht standardmäßig auf Cost Management Reader und Carbon
+  Optimization Reader. Entfernen Sie Carbon Optimization Reader daraus, um das Abonnement aus dem Bericht
+  zum CO2-Fußabdruck herauszuhalten. Ergänzen Sie `"Reader"` nur, wenn Ihre Richtlinien es verlangen.
+- **Mehrere Abonnements.** `additional_subscription_ids` weist dieselben Rollen auf weiteren
+  Abonnements des Mandanten zu und `management_group_ids` auf Verwaltungsgruppen, deren Abonnements
+  sie erben, auch später hinzugefügte; angegeben wird jeweils die ID der Gruppe, und die ID der
+  Stammverwaltungsgruppe ist die Mandanten-ID. Eine Zuweisung auf einer Verwaltungsgruppe braucht
+  Owner oder User Access Administrator auf ihr. Beim Verbinden werden die Abonnements, die der
+  Prinzipal lesen kann, innerhalb von 90 Sekunden geprüft; die in dieser Zeit nicht erreichten
+  erscheinen nach der nächsten täglichen Prüfung, ohne neue Verbindung. Die Ausgabe
+  `assignment_scopes` des Moduls listet jeden Bereich, auf dem es die Rollen zugewiesen hat.
+- **Commitment-Rollen.** `commitment_roles = true` weist zusätzlich Reservations Reader und Savings
+  plan Reader auf ihren Mandantenebenen zu. Nur User Access Administrator auf der Stammebene des
+  Mandanten kann das anwenden ([Commitment-Rollen vergeben](#commitment-rollen-vergeben)); ohne
+  diesen Zugriff schlägt das Apply bei diesen beiden Zuweisungen fehl.
+- **Abrechnungsbereich.** Das Modul vergibt keine Rolle der Abrechnung. Um einen
+  Abrechnungsbereich zu erfassen, vergeben Sie die Rolle, wie
+  [Im Abrechnungsbereich verbinden](#im-abrechnungsbereich-verbinden) zeigt, und ergänzen Sie
+  `costfluent_provider` um `settings = { billing_scope = "billingAccounts/<Registrierungsnummer>" }`,
+  in der Form, die [Abrechnungsbereich](#abrechnungsbereich) für Ihren Vertrag nennt. Wenn Sie
+  `settings` entfernen, wechselt die Verbindung zurück zu ihren Abonnements.
+- **Wirksamwerden.** `costfluent_provider` wartet nicht darauf, dass Azure-Rollenzuweisungen wirksam
+  werden. Schlägt das erste Apply fehl, weil der Prinzipal noch keine Kosten lesen kann, führen Sie
+  `terraform apply` eine Minute später erneut aus.
+- **Secret-Wechsel.** Das Client-Secret gilt `secret_expiry_days` lang, standardmäßig 365 Tage,
+  bis zu dem Zeitpunkt, den die Modulausgabe `secret_expires_at` zeigt. Eine Modulversion mit der
+  Ausgabe `secret_rotates_at` ersetzt es ab diesem Zeitpunkt, `secret_rotation_days_before_expiry`
+  Tage vor dem Ablauf (standardmäßig 30): Ein Apply in diesem Fenster erstellt ein neues Secret und
+  gibt es an die Verbindung weiter, solange das alte noch gilt. Eine ältere Version ersetzt es erst
+  zum oder nach dem Ablauf, und vom Ablauf bis zu diesem Apply kann Costfluent nichts erfassen. Ein
+  Apply außerhalb des Fensters lässt das Secret unverändert. Um zu einem anderen Zeitpunkt zu
+  wechseln, führen Sie
+  `terraform apply -replace='module.costfluent_azure.time_rotating.secret'` aus: Es löscht das alte
+  Secret, erstellt ein neues und gibt es im selben Apply an die Verbindung weiter.
+
+## Daten und Aktualität
+
+Beim Verbinden werden die Kosten jedes Abonnements so weit zurück importiert, wie der rückwirkende
+Import Ihres Tarifs reicht, höchstens sechs Monate
+([Verbindungen verwalten](/de/connect/manage-connections#wie-es-sich-verhält)). Eine später vergebene
+Rolle auf einem weiteren Abonnement braucht keine neue Verbindung: Das Abonnement erscheint nach der
+nächsten Prüfung, und seine erste Erfassung reicht auf dieselbe Weise zurück, gerechnet ab dem Tag,
+an dem es erscheint.
+
+Ein Abrechnungsbereich wird auf dieselbe Weise rückwirkend importiert. Ein Abonnement, das später zur
+Registrierung oder zum Abrechnungsprofil hinzukommt, braucht keine neue Rolle: Seine Kosten kommen
+mit dem Rest der Rechnung.
+
+:::note
+Ein Tag eines Abonnements oder des Abrechnungsbereichs, den eine Verbindung erfasst, seine Berichte
+über tatsächliche und amortisierte Kosten zusammen, darf höchstens 2.560.000 Zeilen und 4 GiB
+Kostendaten enthalten. Ein Abrechnungsbereich bringt den ganzen Tag einer Registrierung oder eines
+Abrechnungsprofils unter diese eine Grenze. Ein größerer Tag stoppt die Verbindung mit einem Fehler,
+der den Tag nennt, statt ihn nur zum Teil zu importieren; wenden Sie sich über das
+[Kontaktformular](https://costfluent.com/de/kontakt) an den Costfluent-Support.
+:::
+
+### Reservierungen und Sparpläne
+
+Mit den [Commitment-Rollen](#commitment-rollen-vergeben) listet Costfluent die Reservierungen und
+Sparpläne des Mandanten unter **Gehaltene Commitments**
+([Commitments](/de/optimization/commitments#gehaltene-commitments)). Azure listet jedes Commitment im
+Mandanten, daher listet eine Verbindung die, die auf einen gemeinsamen Bereich oder eine
+Verwaltungsgruppe angewendet sind, und die, die auf ein einzelnes Abonnement angewendet sind, nur
+dann, wenn die Verbindung dieses Abonnement importiert.
+
+### CO2-Emissionen
+
+Azure veröffentlicht die Emissionen jedes Monats bis zum 19. des Folgemonats und stellt die letzten
+zwölf Monate bereit. Costfluent liest sie am 22.
+([CO2-Fußabdruck](/de/reporting/carbon#wie-es-sich-verhält)), für jedes Abonnement, das die
+Verbindung importiert. Jedes davon braucht Carbon Optimization Reader: Fehlt die Rolle bei einem,
+verweigert Azure dieses Abonnement, und der Monat der Verbindung wird als Ganzes verweigert statt
+unvollständig gezeigt. Der Bericht zum CO2-Fußabdruck nennt dann die Abonnements, die die Rolle
+brauchen. Azure nennt für diese Zahlen keine Bilanzierungsmethode und keine Dienstkategorie, daher
+zeigt der Bericht sie als **Methode nicht angegeben** und nach Ressourcentyp.
+
+Bei einem Abrechnungsbereich sind das die Abonnements, die der Bereich umfasst, und die Rolle der
+Abrechnung reicht nicht bis zu ihren Emissionen: Vergeben Sie Carbon Optimization Reader auf ihnen oder auf
+einer Verwaltungsgruppe darüber.
+
+## Berichtsdimensionen
+
+Was jede Gruppierungsdimension eines [Kostenberichts](/de/cost-reports/explore) für eine
+Azure-Verbindung enthält und aus welcher Spalte von Cost Details sie stammt.
+
+| Dimension | Bei Azure | Quelle |
+|---|---|---|
+| **Anbieter** | `azure` | Die Verbindung |
+| **Anbietername** | `Microsoft Azure`; bei einer Marketplace-Position der Publisher | `PublisherType`, `PublisherName` |
+| **Unterkonto** | Die ID des Abonnements; im Abrechnungsbereich bei einer Position ohne Abonnement die ID des Abrechnungskontos | `SubscriptionId`, sonst `BillingAccountId` |
+| **Dienst** | Der Dienst oder, wenn die Zeile keinen nennt, die Meter-Kategorie | `ServiceName`, sonst `MeterCategory` |
+| **Region** | Der Name des Ressourcenstandorts, etwa `West Europe`; `Global` bei einer Position ohne Standort | `ResourceLocation` |
+| **Ressource** | Der Name der Ressource oder das letzte Segment ihrer ID | `ResourceName`, sonst `ResourceId` |
+| **Kostenkategorie** | Usage (ungenutzte Reservierungen und Savings Plans eingeschlossen), Purchase (Erstattungen eingeschlossen), Tax oder Credit; jeder andere Charge Type ist Adjustment | `ChargeType` |
+| **Dienstkategorie** | Die FOCUS-Kategorie der Zählerkategorie; Cognitive Services, Foundry Models und Azure Machine Learning sind AI and Machine Learning | `MeterCategory`, `MeterSubCategory` |
+| **SKU** | Der Name des Zählers, etwa `gpt-4o-Input-global Tokens` | `MeterName` |
+| **SKU-ID** | Die ID des Zählers | `MeterId` |
+| **Ressourcentyp** | Der Typ der Ressource, wie Cost Details ihn angibt | `ResourceType` |
+| **Produktfamilie** | Die Dienstfamilie, etwa `Compute` oder `Storage` | `ServiceFamily` |
+| **Ressourcengruppe** | Die Ressourcengruppe, aus der ID der Ressource in Kleinbuchstaben gelesen, sodass `RG-App` und `rg-app` eine Gruppe sind | `ResourceId` |
+| **Rechnungs-ID** | Die Rechnung, auf der die Position abgerechnet wird | `InvoiceId` |
+| **Rechnungssteller** | Der Partner oder Wiederverkäufer, der die Position in Rechnung stellt; `Microsoft`, wo es keinen gibt | `PartnerName`, sonst `ResellerName` |
+| **Abrechnungszeitraum** | Der abgerechnete Monat, etwa `2026-03` | `BillingPeriodStartDate` |
+| **Vorgang**, **Kostenbeschreibung** | Nie gefüllt; Cost Details gibt keines davon an | |
+| **Tag** | Jeder Schlüssel der Tags der Zeile | `Tags` |
+| **Segment** | Ihre Zuordnungsregeln | [Segmente und Zuordnungsregeln](/de/allocation/segments) |
+| **Cluster**, **Namespace** | Nie gefüllt; sie tragen Kubernetes-Kosten ([Kubernetes verbinden](/de/connect/kubernetes)) | |
+| **Virtueller Tag** | Ihre Regeln für virtuelle Tags | [Virtuelle Tags](/de/allocation/virtual-tags) |
+
+Ein Azure-Zähler, der je tausend oder je Million Tokens abrechnet, Einheit `1K` oder `1M` bei einem Zähler namens `… Tokens`, wird mit seiner Nutzung als `Tokens` gespeichert, einzeln gezählt, sodass die Messgröße **Nutzung** sie mit den Tokens anderer Anbieter summiert.
+
+## Aktualisieren oder trennen
+
+### Nach dem Verbinden
+
+Der Tab **Verwalten** listet die Verbindung unter ihrem Anzeigenamen, mit ihrer Mandanten-ID in
+einer eigenen Spalte und ihrer **App-ID**. Über das Zahnrad daneben sehen Sie, ob die Zugangsdaten
+noch funktionieren, welche Workspaces die Verbindung speist, welche Abrechnungsmonate importiert
+wurden und eine Karte **Abonnements** mit jedem Abonnement, das der Prinzipal erreicht, und was die
+Verbindung mit jedem tut.
+
+Ein Abonnement, das der Prinzipal zwar sieht, dessen Kosten er aber nicht lesen kann, oder eines, das
+bereits eine andere Verbindung importiert, wird als **Nicht verfügbar** mit Begründung gelistet,
+statt gesund auszusehen und nie Daten zu liefern. Was Azure selbst dazu meldet, steht im Wortlaut
+von Azure am Ende der Begründung.
+
+Bei einem Abrechnungsbereich zeigt die Seite den Bereich, den die Verbindung erfasst, und die Karte
+**Abonnements** listet die Abonnements, die die Kosten des Bereichs bisher genannt haben, als
+**Abgedeckt**. Ein Abonnement, dessen Kosten bereits eine andere Azure-Verbindung importiert, wird
+auf den Seiten beider Verbindungen genannt, und seine Kosten bleiben bei dieser Verbindung.
+
+**Prüfungen ausführen** auf der Verbindungsseite führt die Prüfungen auf Anfrage erneut aus und
+meldet jede einzeln, sodass ein Fehler den fehlgeschlagenen Schritt benennt: die Anmeldung oder das
+Lesen der Kostendaten. Die Ausführung läuft im Hintergrund, und die Seite aktualisiert sich selbst,
+sobald sie fertig ist.
+
+### Zwischen Abonnements und Abrechnungsbereich wechseln
+
+Eine Verbindung wechselt ihren Bereich an Ort und Stelle, und ihre Zugangsdaten bleiben. Um zu einem
+Abrechnungsbereich zu wechseln, vergeben Sie zuerst die Rolle der
+Abrechnung ([Im Abrechnungsbereich verbinden](#im-abrechnungsbereich-verbinden)), nutzen Sie dann
+**Zugangsdaten aktualisieren** auf der Verbindungsseite, wählen Sie **Abrechnungskonto** und geben
+Sie die IDs ein. Costfluent
+prüft den Bereich mit den gespeicherten Zugangsdaten, bevor es ihn speichert, und eine abgelehnte
+Prüfung ändert nichts. Ab dann erfasst die Verbindung den Abrechnungsbereich und listet jedes
+Abonnement als **Abgedeckt**, sobald die Kosten des Bereichs es nennen. Ein bisheriges Abonnement,
+das der Bereich nicht abrechnet, behält die bereits dafür importierten Kosten und steht einer anderen
+Verbindung frei. Bereits je Abonnement importierte Kosten zählen nicht doppelt: Die Zeilen des
+Abrechnungsbereichs ersetzen die Zeilen der Abonnements für dieselben Gebühren.
+
+Um zurückzuwechseln, wählen Sie auf dieselbe Weise **Abonnements**, entfernen Sie `settings` in
+Terraform oder senden Sie `clearSettings` an `PUT /v1/providers/{providerId}` der Public API. Die Verbindung erfasst
+dann wieder ihre Abonnements und importiert deren vergangene Kosten neu, was die Zeilen des
+Abrechnungsbereichs für dieselben Gebühren ersetzt; die Käufe und Steuern, die sie beim
+Abrechnungskonto importiert hat, bleiben.
+
+### Zugangsdaten wechseln oder entfernen
+
+Setzen Sie die Zugangsdaten des Dienstprinzipals in Azure zurück und nutzen Sie dann
+**Zugangsdaten aktualisieren** auf der Verbindungsseite. Mit Terraform wechselt ein einfaches Apply das Secret erst
+ab `secret_rotates_at` (bei einer Modulversion ohne diese Ausgabe erst zum oder nach dem Ablauf); um
+es zu einem anderen Zeitpunkt zu wechseln, ersetzen Sie den Timer des Moduls, wie
+[Mit Terraform verbinden](#mit-terraform-verbinden) zeigt, was die Verbindung im selben Apply
+aktualisiert. Zum
+Stilllegen entfernen Sie die Verbindung in Costfluent und löschen in Azure die Rollenzuweisungen
+und den Dienstprinzipal, oder Sie führen `terraform destroy` aus. Das Entfernen löscht die von ihr
+importierten Kosten ([Verbindung entfernen](/de/connect/manage-connections#verbindung-entfernen)).
+
+## Fehlerbehebung
+
+Eine Überschrift je Meldung, wie die Verbindungsseite sie zeigt: unter den Verbindungsprüfungen oder
+als Begründung neben einem Abonnement auf der Karte **Abonnements**, wo der Wortlaut von Azure die
+Begründung beendet. **Prüfungen ausführen** führt die Prüfungen erneut aus.
+
+### Costfluent konnte sich nicht mit den Azure-Zugangsdaten anmelden.
+
+Mandanten-ID, App-ID oder Client-Secret sind falsch, oder das Secret ist abgelaufen (mit Terraform
+gilt es `secret_expiry_days`, standardmäßig 365). Setzen Sie das Secret in Azure zurück und verwenden Sie
+**Zugangsdaten aktualisieren** auf der Verbindungsseite
+([Zugangsdaten wechseln oder entfernen](#zugangsdaten-wechseln-oder-entfernen)).
+
+### Costfluent konnte keine Sparempfehlungen von Azure lesen.
+
+Kosten kommen weiterhin an, und die Verbindung gilt als beeinträchtigt, bis das behoben ist. Azure
+Advisor hat den Dienstprinzipal auf dem Abonnement abgewiesen, das die Meldung neben der Prüfung
+nennt. Cost Management Reader, die Rolle, die die Verbindung ohnehin braucht, enthält
+`Microsoft.Advisor/recommendations/read`; weisen Sie sie auf diesem Abonnement erneut zu oder auf einer
+Verwaltungsgruppe, die es umfasst. Die Kostenempfehlungen von Advisor erscheinen danach nach dem
+nächsten täglichen Abruf unter **Einsparungen**. Eine Rolle der Abrechnung reicht nicht bis zu
+Advisor, daher braucht eine Verbindung im Abrechnungsbereich Cost Management Reader auf den
+Abonnements, die der Bereich umfasst ([Abrechnungsbereich](#abrechnungsbereich)).
+
+### Costfluent konnte die Commitments von Azure nicht lesen.
+
+Kosten kommen weiterhin an, und die Verbindung bleibt **In Ordnung**. Azure hat die Liste der
+Reservierungen, der Sparpläne oder beide abgewiesen: Dem Dienstprinzipal fehlt Reservations Reader
+auf `/providers/Microsoft.Capacity` oder Savings plan Reader auf `/providers/Microsoft.BillingBenefits`,
+und die Meldung neben der Prüfung nennt, welche. Beide Rollen sind optional; weisen Sie sie zu, wie
+[Commitment-Rollen vergeben](#commitment-rollen-vergeben) zeigt, und wählen Sie dann
+**Prüfungen ausführen**. Bis dahin nennt **Commitments** die Verbindung über **Gehaltene Commitments**.
+
+### Costfluent konnte keine Kostendaten von Azure lesen.
+
+Die Anmeldung hat funktioniert, aber der Cost-Details-Bericht ließ sich nicht lesen. Die Begründung
+neben jedem Abonnement auf der Karte **Abonnements** nennt die Ursache, bei einem Abrechnungsbereich
+die Begründung unter der Prüfung; die folgenden Überschriften sind die üblichen.
+
+### Der Dienstprinzipal kann Cost Management für dieses Abonnement nicht lesen
+
+Der Prinzipal hat keine Zuweisung von **Cost Management Reader** auf dem Abonnement oder einer
+Verwaltungsgruppe darüber, oder die Zuweisung ist noch nicht wirksam: Rollenzuweisungen brauchen
+einen Moment, und ein Fehler unmittelbar nach dem Anlegen beweist nicht, dass die Zugangsdaten falsch
+sind. Weisen Sie die Rolle zu ([Wie Costfluent verbindet](#wie-costfluent-verbindet)) und wählen
+Sie eine Minute später **Prüfungen ausführen**; mit Terraform führen Sie `terraform apply`
+erneut aus.
+
+### Das Abonnement wurde nicht gefunden, oder der Dienstprinzipal sieht es nicht
+
+Die Abonnement-ID ist falsch, der Prinzipal hat gar keine Zuweisung darauf, oder das Abonnement
+liegt nicht unter einem Enterprise Agreement oder einem Microsoft Customer Agreement: Die Cost
+Details API von Azure, die Costfluent liest, bedient keine Pay-as-you-go-Abonnements
+([Voraussetzungen](#voraussetzungen)). Die Antwort von Azure beendet die Begründung.
+
+### Azure hat die Cost-Details-Anfrage für dieses Abonnement abgelehnt
+
+Azure hat die Anmeldung angenommen und kennt das Abonnement, verweigert aber den Cost-Details-Bericht
+dafür. So antwortet ein Pay-as-you-go-Abonnement; der Wortlaut von Azure am Ende der Begründung
+unterscheidet das von einer vertippten ID.
+
+### Der Dienstprinzipal kann Cost Management für diese Registrierung nicht lesen
+
+Die Verbindung erfasst eine Enterprise-Agreement-Registrierung, und der Prinzipal hat keine
+Zuweisung von Enrollment reader auf ihrem Abrechnungskonto. Weisen Sie die Rolle mit dem Aufruf
+für Rollenzuweisungen der Abrechnung zu
+([Im Abrechnungsbereich verbinden](#im-abrechnungsbereich-verbinden)); das Azure-Portal zeigt diese
+Zuweisung nicht, dort lässt sie sich also nicht prüfen. Wählen Sie dann **Prüfungen ausführen**.
+
+### Der Dienstprinzipal kann Cost Management für diesen Abrechnungsbereich nicht lesen
+
+Die Verbindung erfasst ein Abrechnungskonto oder Abrechnungsprofil unter einem Microsoft Customer
+Agreement, und der Prinzipal hat weder Billing account reader auf dem Abrechnungskonto noch Billing
+profile reader auf dem Abrechnungsprofil. Vergeben Sie eine davon im Azure-Portal
+([Im Abrechnungsbereich verbinden](#im-abrechnungsbereich-verbinden)) und wählen Sie dann **Prüfungen
+ausführen**.
+
+### Das Abrechnungskonto oder Abrechnungsprofil wurde nicht gefunden, oder der Dienstprinzipal sieht es nicht
+
+Die ID im Bereich ist falsch oder nennt ein Abrechnungskonto oder Abrechnungsprofil, auf dem der
+Prinzipal keine Rolle hat. Vergleichen Sie sie mit den IDs unter Kostenverwaltung + Abrechnung im
+Azure-Portal ([Abrechnungsbereich](#abrechnungsbereich)) und korrigieren Sie sie an der Verbindung
+([Zwischen Abonnements und Abrechnungsbereich wechseln](#zwischen-abonnements-und-abrechnungsbereich-wechseln)).
+
+### Azure hat die Cost-Details-Anfrage für diesen Abrechnungsbereich abgelehnt
+
+Azure hat die Anmeldung angenommen und kennt den Bereich, verweigert aber den Cost-Details-Bericht
+dafür. So antwortet ein Pay-as-you-go-Abrechnungskonto im Microsoft Online Services Program, und
+ein solches Konto importiert Costfluent in keinem der beiden Bereiche
+([Voraussetzungen](#voraussetzungen)).
+
+### Das Azure-Abonnement … wird bereits von einer anderen Azure-Verbindung in dieser Organisation erfasst
+
+Der Prinzipal einer anderen Verbindung importiert das Abonnement bereits, daher listet diese es als
+**Nicht verfügbar** und importiert die übrigen; ein Prinzipal, der nur solche Abonnements erreicht,
+wird abgelehnt. Entfernen Sie die Rollenzuweisung bei einem der beiden Prinzipale, oder verschieben Sie
+die Abonnements, indem Sie die Zugangsdaten der bestehenden Verbindung aktualisieren, statt eine
+Verbindung hinzuzufügen ([Wie Costfluent verbindet](#wie-costfluent-verbindet)).
+
+

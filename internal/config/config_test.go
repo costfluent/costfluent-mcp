@@ -28,6 +28,12 @@ func TestLoadRequiresAToken(t *testing.T) {
 			t.Errorf("token %q: err = %v, want one naming %s", value, err, EnvAPIToken)
 		}
 	}
+	// The stdio server and the costfluent command both read the token, so the message names neither
+	// as the only place it goes.
+	_, err := Load(env(map[string]string{}))
+	if err == nil || !strings.Contains(err.Error(), "set it in the environment the MCP server or the costfluent command runs in") {
+		t.Errorf("err = %v, want it to say where the token is set", err)
+	}
 }
 
 func TestLoadAcceptsHTTPSAndLoopbackHTTP(t *testing.T) {
@@ -67,5 +73,19 @@ func TestConfigNeverPrintsTheToken(t *testing.T) {
 		if strings.Contains(s, token) {
 			t.Errorf("printed %q", s)
 		}
+	}
+}
+
+func TestBaseURLNeedsNoToken(t *testing.T) {
+	got, err := BaseURL(env(map[string]string{}))
+	if err != nil || got != DefaultBaseURL {
+		t.Errorf("unset: %q, %v", got, err)
+	}
+	got, err = BaseURL(env(map[string]string{EnvBaseURL: " http://localhost:5100/ "}))
+	if err != nil || got != "http://localhost:5100" {
+		t.Errorf("loopback: %q, %v", got, err)
+	}
+	if _, err := BaseURL(env(map[string]string{EnvBaseURL: "http://api.costfluent.com"})); err == nil || !strings.Contains(err.Error(), EnvBaseURL) {
+		t.Errorf("plain http: err = %v, want one naming %s", err, EnvBaseURL)
 	}
 }

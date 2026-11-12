@@ -1,0 +1,22 @@
+{
+  "theme": "dark",
+  "mcpServers": {
+    "github": {
+      "command": "gh-mcp",
+      "env": {
+        "N": 1.50
+      }
+    },
+    "costfluent": {
+      "command": "/opt/costfluent/bin/costfluent-mcp",
+      "args": [],
+      "env": {
+        "COSTFLUENT_API_TOKEN": "${env:COSTFLUENT_API_TOKEN}"
+      }
+    }
+  },
+  "z": [
+    1,
+    2
+  ]
+}

@@ -1,0 +1,7 @@
+[mcp_servers.other]
+command = "other"
+
+[mcp_servers.costfluent]
+command = "/opt/costfluent/bin/costfluent-mcp"
+args = []
+env_vars = ["COSTFLUENT_API_TOKEN"]

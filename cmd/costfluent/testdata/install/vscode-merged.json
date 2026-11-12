@@ -1,0 +1,27 @@
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "other"
+    },
+    {
+      "type": "promptString",
+      "id": "costfluent-api-token",
+      "description": "Costfluent API token",
+      "password": true
+    }
+  ],
+  "servers": {
+    "db": {
+      "command": "db-mcp"
+    },
+    "costfluent": {
+      "type": "stdio",
+      "command": "/opt/costfluent/bin/costfluent-mcp",
+      "args": [],
+      "env": {
+        "COSTFLUENT_API_TOKEN": "${input:costfluent-api-token}"
+      }
+    }
+  }
+}
