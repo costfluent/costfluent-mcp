@@ -228,12 +228,10 @@ func TestSourceTimesOutAndWrapsNoTransportError(t *testing.T) {
 	o := newOrigin(t)
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
-	o.answer(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-release:
-		case <-r.Context().Done():
-		}
-	})
+	// The origin holds the request until cleanup, never until the request's context ends: the
+	// client's timeout closes the TLS connection with a close_notify alert first, which ends that
+	// context, and the empty 200 the handler would then answer can still reach the transport.
+	o.answer(func(http.ResponseWriter, *http.Request) { <-release })
 	s := newTestSource(o, &clock{now: time.Now()})
 	s.client.Timeout = 50 * time.Millisecond
 	_, err := s.Index(context.Background())
