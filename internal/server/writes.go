@@ -215,6 +215,28 @@ func (h *handlers) createBudget(ctx context.Context, in CreateBudgetInput) (*cos
 	})
 }
 
+// maxBudgetAlerts is the most alerts the Public API lets a budget hold: each whole percent from 1 to
+// 200, against the spend and against the forecast.
+const maxBudgetAlerts = 400
+
+// withoutRepeats appends to held each item of add it does not yet hold, in add's order, and returns
+// it. It tracks what is held in a set, so its cost is linear in both lists: the hosted server merges
+// whatever a 1 MiB body names, and scanning held for each item is quadratic, which holds a core the
+// container shares with every organization for seconds on such a list.
+func withoutRepeats[T comparable](held, add []T) []T {
+	seen := make(map[T]struct{}, len(held)+len(add))
+	for _, v := range held {
+		seen[v] = struct{}{}
+	}
+	for _, v := range add {
+		if _, ok := seen[v]; !ok {
+			seen[v] = struct{}{}
+			held = append(held, v)
+		}
+	}
+	return held
+}
+
 type UpdateBudgetInput struct {
 	BudgetID           string   `json:"budget_id" jsonschema:"the budget to change, as list_budgets names it"`
 	Name               string   `json:"name,omitempty" jsonschema:"the budget's new name"`
@@ -240,6 +262,12 @@ func (h *handlers) updateBudget(ctx context.Context, in UpdateBudgetInput) (*cos
 	if len(add) > 0 {
 		// The API replaces a budget's thresholds with the list an update sends, so the list goes
 		// with every threshold the budget holds: one the call does not name is never removed.
+		// The hosted server takes any list its 1 MiB body holds, so a list naming more distinct
+		// thresholds than the API's bound, which the merged list could then only exceed, is refused
+		// here, before it costs the read. Repeats do not count: the merge sends each threshold once.
+		if n := len(withoutRepeats(nil, add)); n > maxBudgetAlerts {
+			return nil, fmt.Errorf("add_alert_thresholds names %d distinct thresholds; a budget holds at most %d", n, maxBudgetAlerts)
+		}
 		current, err := h.client.GetBudget(ctx, in.BudgetID)
 		if err != nil {
 			return nil, err
@@ -248,11 +276,7 @@ func (h *handlers) updateBudget(ctx context.Context, in UpdateBudgetInput) (*cos
 		for _, a := range current.Alerts {
 			alerts = append(alerts, costfluent.BudgetAlertInput{ThresholdPercent: a.ThresholdPercent, Basis: a.Basis})
 		}
-		for _, a := range add {
-			if !slices.Contains(alerts, a) {
-				alerts = append(alerts, a)
-			}
-		}
+		alerts = withoutRepeats(alerts, add)
 		input.Alerts = &alerts
 		opts = append(opts, costfluent.IfMatch(current.ETag))
 	}
@@ -329,12 +353,7 @@ func (h *handlers) updateCostAlert(ctx context.Context, in UpdateCostAlertInput)
 		if err != nil {
 			return nil, err
 		}
-		apps := slices.Clone(current.AppIDs)
-		for _, id := range in.AddAppIDs {
-			if !slices.Contains(apps, id) {
-				apps = append(apps, id)
-			}
-		}
+		apps := withoutRepeats(slices.Clone(current.AppIDs), in.AddAppIDs)
 		input.AppIDs = &apps
 		opts = append(opts, costfluent.IfMatch(current.ETag))
 	}

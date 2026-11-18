@@ -146,6 +146,17 @@ func sectionBody(doc *Document, s Section) string {
 // ErrNoWords is a query that holds no word to search for.
 var ErrNoWords = errors.New("the query holds no word to search for; ask in words, such as \"budget alerts terraform\"")
 
+// MaxQueryTerms is the most distinct words, stop words aside, a query may search for. Each term costs
+// an index walk and a check against every body word of each excerpt, and the hosted server takes
+// queries up to its 1 MiB body cap on a CPU every organization shares: unbounded, one query of
+// 200,000 distinct words held a core for over a minute. 32 is far past any real question; raised
+// much higher, one call's work grows back toward that, and lowered, a long question an assistant
+// passes verbatim is refused.
+const MaxQueryTerms = 32
+
+// ErrTooManyWords is a query of more distinct words than MaxQueryTerms.
+var ErrTooManyWords = fmt.Errorf("the query holds more than %d distinct words; ask in a few words, such as \"budget alerts terraform\"", MaxQueryTerms)
+
 // Search ranks language's sections for query and returns the best limit, at most two of a page.
 func (ix *Index) Search(query, language string, limit int) ([]Hit, error) {
 	language = cmp.Or(language, Languages[0])
@@ -158,10 +169,16 @@ func (ix *Index) Search(query, language string, limit int) ([]Hit, error) {
 		return nil, fmt.Errorf("limit must be between 1 and %d, not %d", MaxLimit, limit)
 	}
 	var terms []string
+	seen := map[string]bool{}
 	for _, w := range words(query) {
-		if !stopWords[w.term] && !slices.Contains(terms, w.term) {
-			terms = append(terms, w.term)
+		if stopWords[w.term] || seen[w.term] {
+			continue
 		}
+		if len(terms) == MaxQueryTerms {
+			return nil, ErrTooManyWords
+		}
+		seen[w.term] = true
+		terms = append(terms, w.term)
 	}
 	if len(terms) == 0 {
 		return nil, ErrNoWords
