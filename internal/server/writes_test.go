@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -309,6 +311,96 @@ func lastWrite(t *testing.T, api *fakeAPI) exchange {
 	return writes[len(writes)-1]
 }
 
+// reportFlags are a cost report's boolean settings: the tool input and the API key it is sent under.
+var reportFlags = []struct{ input, key string }{
+	{"amortize", "amortize"}, {"include_credits", "includeCredits"}, {"include_refunds", "includeRefunds"},
+	{"include_tax", "includeTax"}, {"show_forecast", "showForecast"}, {"compare_to_last_period", "compareToLastPeriod"},
+}
+
+// Each optional input a write tool takes is sent under its own API key, so an assistant asked to
+// include credits, scope a budget to a segment or alert only above an amount gets that setting.
+func TestEveryWriteToolSendsEachOptionalInputUnderItsOwnKey(t *testing.T) {
+	type sends struct {
+		name, tool string
+		args, want map[string]any
+	}
+	var cases []sends
+	// Two flags holding one value would hide a swap between them, so each report tool is called
+	// once per bit of a three-bit code distinct for every flag: any two flags differ in one call.
+	for bit := range 3 {
+		args := map[string]any{"chart_type": "line", "date_bin": "week", "date_interval": "custom", "start_date": "2026-01-01",
+			"end_date": "2026-03-31", "filter": "costs.provider = 'aws'", "folder_id": "fld_finance", "group_by": []string{"Region"},
+			"measure": "usage"}
+		settings := map[string]any{"measure": "usage"}
+		for i, f := range reportFlags {
+			on := (i+1)>>bit&1 == 1
+			args[f.input] = on
+			settings[f.key] = on
+		}
+		want := map[string]any{"chartType": "line", "dateBin": "week", "dateInterval": "custom", "startDate": "2026-01-01",
+			"endDate": "2026-03-31", "filter": "costs.provider = 'aws'", "folderId": "fld_finance",
+			"groupBy": []map[string]any{{"dimension": "Region"}}, "settings": settings}
+
+		create := maps.Clone(args)
+		create["title"] = "AWS by region"
+		createWant := maps.Clone(want)
+		createWant["title"] = "AWS by region"
+		cases = append(cases, sends{name: fmt.Sprintf("create_cost_report/flags bit %d", bit), tool: "create_cost_report", args: create, want: createWant})
+
+		update := maps.Clone(args)
+		update["cost_report_id"] = reportID
+		update["title"] = "Renamed"
+		updateSettings := maps.Clone(settings)
+		// The unit cost metric and comparison window the report holds go back with the settings.
+		updateSettings["unitCostMetricId"] = "bmt_requests"
+		updateSettings["unitCostLabelFilter"] = []map[string]any{{"key": "region", "values": []string{"eu"}}}
+		updateSettings["comparisonStartDate"] = "2026-09-01"
+		updateSettings["comparisonEndDate"] = "2026-09-30"
+		updateWant := maps.Clone(want)
+		updateWant["title"] = "Renamed"
+		updateWant["settings"] = updateSettings
+		cases = append(cases, sends{name: fmt.Sprintf("update_cost_report/flags bit %d", bit), tool: "update_cost_report", args: update, want: updateWant})
+	}
+	cases = append(cases,
+		sends{name: "create_budget", tool: "create_budget",
+			args: map[string]any{"name": "Tokens", "currency": "USD", "amount": "5000", "start_date": "2026-12-01", "interval_count": 3,
+				"interval_unit": "month", "measure": "usage", "usage_unit": "Tokens", "cost_report_id": reportID, "segment_id": "seg_platform",
+				"alert_thresholds": []string{"50"}, "app_ids": []string{"app_mail", "app_slack"}},
+			want: map[string]any{"name": "Tokens", "currency": "USD", "amount": "5000", "startDate": "2026-12-01", "intervalCount": 3,
+				"intervalUnit": "month", "measure": "usage", "usageUnit": "Tokens", "costReportId": reportID, "segmentId": "seg_platform",
+				"alerts": []map[string]any{{"thresholdPercent": 50, "basis": "actual"}}, "appIds": []string{"app_mail", "app_slack"}}},
+		sends{name: "update_budget", tool: "update_budget",
+			args: map[string]any{"budget_id": "bud_1", "name": "Platform 2027", "amount": "7500.25", "cost_report_id": "rpt_platform", "segment_id": "seg_data"},
+			want: map[string]any{"name": "Platform 2027", "amount": "7500.25", "costReportId": "rpt_platform", "segmentId": "seg_data"}},
+		sends{name: "create_cost_alert", tool: "create_cost_alert",
+			args: map[string]any{"name": "EC2 week over week", "threshold_type": "percentageIncrease", "threshold_value": "25",
+				"comparison_period": "previousWeek", "minimum_amount": "50", "provider_ids": []string{"prv_1", "prv_2"},
+				"filter": "costs.service = 'AmazonEC2'", "app_ids": []string{"app_mail"}, "evaluation_frequency_minutes": 30},
+			want: map[string]any{"name": "EC2 week over week", "thresholdType": "percentageIncrease", "thresholdValue": "25",
+				"comparisonPeriod": "previousWeek", "minimumAmount": "50", "providerIds": []string{"prv_1", "prv_2"},
+				"filter": "costs.service = 'AmazonEC2'", "appIds": []string{"app_mail"}, "evaluationFrequencyMinutes": 30}},
+		sends{name: "update_cost_alert", tool: "update_cost_alert",
+			args: map[string]any{"cost_alert_id": "cal_1", "name": "RDS month over month", "threshold_type": "percentageIncrease",
+				"threshold_value": "15", "comparison_period": "previousMonth", "minimum_amount": "75", "provider_ids": []string{"prv_2"},
+				"filter": "costs.service = 'AmazonRDS'", "add_app_ids": []string{"app_mail"}, "evaluation_frequency_minutes": 120},
+			want: map[string]any{"name": "RDS month over month", "thresholdType": "percentageIncrease", "thresholdValue": "15",
+				"comparisonPeriod": "previousMonth", "minimumAmount": "75", "providerIds": []string{"prv_2"},
+				"filter": "costs.service = 'AmazonRDS'", "appIds": []string{"app_slack", "app_mail"}, "evaluationFrequencyMinutes": 120}},
+		sends{name: "create_dashboard", tool: "create_dashboard",
+			args: map[string]any{"title": "October", "date_interval": "custom", "date_bin": "week", "start_date": "2026-10-01", "end_date": "2026-10-31"},
+			want: map[string]any{"title": "October", "dateInterval": "custom", "dateBin": "week", "startDate": "2026-10-01", "endDate": "2026-10-31"}},
+	)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			api, cs := writer(t)
+			if res := call(t, cs, c.tool, c.args); res.IsError {
+				t.Fatalf("refused: %s", text(res))
+			}
+			holds(t, lastWrite(t, api).body, c.want)
+		})
+	}
+}
+
 // The API replaces a budget's thresholds with the list an update sends, so a call adding one sends
 // every threshold the budget holds too, under the version it read.
 func TestUpdateBudgetKeepsTheThresholdsItDoesNotName(t *testing.T) {
@@ -351,6 +443,70 @@ func TestUpdateCostAlertKeepsItsChannelsAndRefusesAnEmptyConnectionList(t *testi
 	if n := len(api.received()) - before; n != 0 {
 		t.Errorf("an empty provider_ids sent %d requests", n)
 	}
+}
+
+// The merge adds each threshold once, the budget's own first and then the call's in the order named,
+// and a call naming more distinct thresholds than a budget can hold is refused before the budget is
+// read; repeats do not count toward that bound, since the merged list sends each threshold once.
+func TestUpdateBudgetAddsEachThresholdOnceAndRefusesMoreThanABudgetHolds(t *testing.T) {
+	api, cs := writer(t)
+	res := call(t, cs, "update_budget", map[string]any{"budget_id": "bud_1", "add_alert_thresholds": []string{"90", "80", "90:actual", "100:forecast", "70", "90"}})
+	if res.IsError {
+		t.Fatalf("refused: %s", text(res))
+	}
+	holds(t, lastWrite(t, api).body, map[string]any{"alerts": []map[string]any{
+		{"thresholdPercent": 80, "basis": "actual"}, {"thresholdPercent": 100, "basis": "forecast"},
+		{"thresholdPercent": 90, "basis": "actual"}, {"thresholdPercent": 70, "basis": "actual"},
+	}})
+
+	var tooMany []string
+	for p := 1; p <= 200; p++ {
+		tooMany = append(tooMany, strconv.Itoa(p), strconv.Itoa(p)+":forecast")
+	}
+	// Exactly the bound is accepted: the budget's own 80 and 100:forecast are among the 400, so
+	// the merged list stays at 400 too.
+	before := len(api.received())
+	res = call(t, cs, "update_budget", map[string]any{"budget_id": "bud_1", "add_alert_thresholds": tooMany})
+	if res.IsError {
+		t.Fatalf("400 distinct thresholds refused: %s", text(res))
+	}
+	writes := writesOf(api.received()[before:])
+	if len(writes) != 1 {
+		t.Fatalf("400 distinct thresholds sent %d writes, want 1", len(writes))
+	}
+	if alerts, _ := writes[0].body["alerts"].([]any); len(alerts) != maxBudgetAlerts {
+		t.Errorf("400 distinct thresholds wrote %d alerts, want %d", len(alerts), maxBudgetAlerts)
+	}
+
+	tooMany = append(tooMany, "201")
+	before = len(api.received())
+	res = call(t, cs, "update_budget", map[string]any{"budget_id": "bud_1", "add_alert_thresholds": tooMany})
+	if !res.IsError || !strings.Contains(text(res), "at most 400") {
+		t.Errorf("401 distinct thresholds: %s, want a refusal naming the bound", text(res))
+	}
+	if n := len(api.received()) - before; n != 0 {
+		t.Errorf("401 distinct thresholds sent %d requests", n)
+	}
+
+	repeated := slices.Repeat([]string{"60", "50:forecast"}, 300)
+	res = call(t, cs, "update_budget", map[string]any{"budget_id": "bud_1", "add_alert_thresholds": repeated})
+	if res.IsError {
+		t.Fatalf("600 thresholds naming two distinct ones refused: %s", text(res))
+	}
+	holds(t, lastWrite(t, api).body, map[string]any{"alerts": []map[string]any{
+		{"thresholdPercent": 80, "basis": "actual"}, {"thresholdPercent": 100, "basis": "forecast"},
+		{"thresholdPercent": 60, "basis": "actual"}, {"thresholdPercent": 50, "basis": "forecast"},
+	}})
+}
+
+// The merge adds each channel once, the alert's own first and then the call's in the order named.
+func TestUpdateCostAlertAddsEachChannelOnce(t *testing.T) {
+	api, cs := writer(t)
+	res := call(t, cs, "update_cost_alert", map[string]any{"cost_alert_id": "cal_1", "add_app_ids": []string{"app_mail", "app_slack", "app_mail", "app_teams", "app_teams"}})
+	if res.IsError {
+		t.Fatalf("refused: %s", text(res))
+	}
+	holds(t, lastWrite(t, api).body, map[string]any{"appIds": []string{"app_slack", "app_mail", "app_teams"}})
 }
 
 // Settings an update sends replace the report's unit cost metric and comparison window, so a call
@@ -419,13 +575,38 @@ func TestAddDashboardWidgetTakesAWholePositionOrNone(t *testing.T) {
 // A create whose object exists but cannot be read back, as with a token without the read
 // capability, names the object so the assistant does not create it again.
 func TestACreateReadBackFailureNamesTheCreatedObject(t *testing.T) {
-	api, srv := newFakeAPI(t, map[string]token{tokenSecret: {workspace: ownWS, capabilities: []costfluent.Capability{costfluent.CapabilityCreateCostReport}}})
-	api.setAgentWrites(true)
-	res := call(t, session(t, srv.URL, tokenSecret), "create_cost_report", map[string]any{"title": "EC2"})
-	failed(t, res)
-	if !strings.Contains(text(res), "created rpt_new") || !strings.Contains(text(res), "do not create it again") ||
-		!strings.Contains(text(res), "viewCostReports") {
-		t.Errorf("error %q does not name the created report and why it was not read", text(res))
+	for _, tc := range []struct {
+		tool         string
+		capabilities []costfluent.Capability
+		args         map[string]any
+		createdID    string
+		missingRead  costfluent.Capability
+	}{
+		{tool: "create_cost_report", capabilities: []costfluent.Capability{costfluent.CapabilityCreateCostReport},
+			args: map[string]any{"title": "EC2"}, createdID: "rpt_new", missingRead: costfluent.CapabilityViewCostReports},
+		{tool: "create_cost_alert", capabilities: []costfluent.Capability{costfluent.CapabilityManageAlerts},
+			args:      map[string]any{"name": "EC2 over 1000", "threshold_type": "absolute", "threshold_value": "1000"},
+			createdID: "cal_new", missingRead: costfluent.CapabilityViewCosts},
+		{tool: "create_dashboard", capabilities: []costfluent.Capability{costfluent.CapabilityCreateDashboard},
+			args: map[string]any{"title": "Platform"}, createdID: "dsh_new", missingRead: costfluent.CapabilityViewDashboards},
+		// A whole position, so the tool creates the widget without reading the dashboard first,
+		// which this token cannot.
+		{tool: "add_dashboard_widget",
+			capabilities: []costfluent.Capability{costfluent.CapabilityUpdateDashboard, costfluent.CapabilityViewCostReports},
+			args: map[string]any{"dashboard_id": "dsh_1", "title": "Monthly", "cost_report_id": reportID, "display": "chart",
+				"column": 0, "row": 0, "width": 6, "height": 4},
+			createdID: "wdg_new", missingRead: costfluent.CapabilityViewDashboards},
+	} {
+		t.Run(tc.tool, func(t *testing.T) {
+			api, srv := newFakeAPI(t, map[string]token{tokenSecret: {workspace: ownWS, capabilities: tc.capabilities}})
+			api.setAgentWrites(true)
+			res := call(t, session(t, srv.URL, tokenSecret), tc.tool, tc.args)
+			failed(t, res)
+			if !strings.Contains(text(res), "created "+tc.createdID) || !strings.Contains(text(res), "do not create it again") ||
+				!strings.Contains(text(res), string(tc.missingRead)) {
+				t.Errorf("error %q does not name the created %s and why it was not read", text(res), tc.createdID)
+			}
+		})
 	}
 }
 

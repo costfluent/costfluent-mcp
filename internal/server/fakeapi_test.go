@@ -1,16 +1,21 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/costfluent/costfluent-mcp/internal/costfluent"
@@ -76,6 +81,40 @@ func newFakeAPI(t *testing.T, tokens map[string]token) (*fakeAPI, *httptest.Serv
 	srv := httptest.NewServer(api)
 	t.Cleanup(srv.Close)
 	return api, srv
+}
+
+// refusableClient is a client of the fake API at baseURL for secret, and refuse, after which every
+// request the client sends fails to connect, as a stopped API refuses it. A test makes the API
+// unreachable with refuse rather than by closing its server: a closed server's port is free for any
+// process to take, and go test ./... runs the packages' test binaries at once, so while the SDK
+// backs off between retries another package's fake API can listen on that port and answer the
+// "unreachable" call with its own 401.
+func refusableClient(t *testing.T, baseURL, secret string) (*costfluent.Client, func()) {
+	t.Helper()
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		t.Fatalf("http.DefaultTransport is a %T", http.DefaultTransport)
+	}
+	var refused atomic.Bool
+	transport := base.Clone()
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if refused.Load() {
+			tcp, err := net.ResolveTCPAddr(network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return nil, &net.OpError{Op: "dial", Net: network, Addr: tcp, Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
+	}
+	client := costfluent.NewClient(costfluent.WithAPIKey(secret), costfluent.WithBaseURL(baseURL),
+		costfluent.WithHTTPClient(&http.Client{Transport: transport, Timeout: costfluent.DefaultTimeout}))
+	return client, func() {
+		refused.Store(true)
+		// A kept-alive connection would still reach the API.
+		transport.CloseIdleConnections()
+	}
 }
 
 func problem(w http.ResponseWriter, status int, code, title, detail string) {
@@ -150,7 +189,8 @@ func (api *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"/v1/kubernetes/efficiency":              costfluent.CapabilityViewCosts,
 	}[r.URL.Path]
 	if need == "" {
-		problem(w, http.StatusNotFound, "not_found", "Not Found", "no such route in the fake API: "+r.URL.Path)
+		// The Public API's answer to a path no operation serves; not_found would read as a missing object.
+		problem(w, http.StatusNotFound, "operation_not_found", "Resource Not Found", "no such route in the fake API: "+r.URL.Path)
 		return
 	}
 	if !slices.Contains(tok.capabilities, need) {
@@ -419,7 +459,7 @@ var objectRoutes = map[string]objectRoute{
 func (api *fakeAPI) serveObject(w http.ResponseWriter, r *http.Request, tok token, template string, ids []string, body map[string]any) {
 	route, ok := objectRoutes[r.Method+" "+template]
 	if !ok {
-		problem(w, http.StatusNotFound, "not_found", "Not Found", "no such route in the fake API: "+r.Method+" "+r.URL.Path)
+		problem(w, http.StatusNotFound, "operation_not_found", "Resource Not Found", "no such route in the fake API: "+r.Method+" "+r.URL.Path)
 		return
 	}
 	for _, need := range route.need {

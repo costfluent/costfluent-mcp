@@ -3,6 +3,7 @@ package docs
 import (
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -161,6 +162,37 @@ func TestSearchRefusesAQueryWithNoWordAndBadBounds(t *testing.T) {
 	}
 	if hits := search(t, ix, "xylophone", "en", 5); hits == nil || len(hits) != 0 {
 		t.Errorf("no match is %#v, want an empty list", hits)
+	}
+}
+
+// Search bounds a query by its distinct words, stop words and repeats aside, so its work stays
+// within a constant however long the query: at the bound it searches, one past it it refuses.
+func TestSearchBoundsTheDistinctWordsOfAQuery(t *testing.T) {
+	ix := publishedIndex(t)
+	distinct := func(n int) string {
+		ws := []string{"budget", "alerts", "terraform"}
+		for i := 0; len(ws) < n; i++ {
+			ws = append(ws, "w"+strconv.Itoa(i))
+		}
+		return strings.Join(ws[:n], " ")
+	}
+	for _, q := range []string{
+		distinct(MaxQueryTerms),
+		distinct(MaxQueryTerms) + " how do I the with you",
+		strings.Repeat("budget alerts terraform Budgets ", 10_000),
+		distinct(MaxQueryTerms) + " " + distinct(MaxQueryTerms),
+	} {
+		if hits, err := ix.Search(q, "en", 5); err != nil || len(hits) == 0 || !strings.Contains(hits[0].URL, "/developers/terraform") {
+			t.Errorf("Search(%.60q…) = %+v, %v; want the Terraform sections", q, hits, err)
+		}
+	}
+	for _, q := range []string{distinct(MaxQueryTerms + 1), distinct(10_000)} {
+		if _, err := ix.Search(q, "en", 5); !errors.Is(err, ErrTooManyWords) {
+			t.Errorf("Search(%.60q…) = %v, want ErrTooManyWords", q, err)
+		}
+	}
+	if !strings.Contains(ErrTooManyWords.Error(), "more than "+strconv.Itoa(MaxQueryTerms)) {
+		t.Errorf("ErrTooManyWords %q does not name the bound", ErrTooManyWords)
 	}
 }
 

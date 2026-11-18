@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -35,6 +38,8 @@ type fakeAS struct {
 	deny          bool
 	refuseRefresh bool
 	revokeFails   bool
+	// requests counts every request the server received.
+	requests atomic.Int32
 
 	mu      sync.Mutex
 	issued  int
@@ -62,7 +67,11 @@ func signInAPI(t *testing.T) (*fakeAPI, *fakeAS, map[string]string) {
 	}))
 	t.Cleanup(apiSrv.Close)
 	as.apiURL = apiSrv.URL
-	as.srv = httptest.NewServer(as.mux())
+	mux := as.mux()
+	as.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		as.requests.Add(1)
+		mux.ServeHTTP(w, r)
+	}))
 	t.Cleanup(as.srv.Close)
 	return api, as, map[string]string{"COSTFLUENT_BASE_URL": apiSrv.URL}
 }
@@ -291,8 +300,18 @@ func TestARefusedRefreshAsksForANewSignIn(t *testing.T) {
 		t.Fatalf("whoami: exit %d, stderr %q", res.code, res.stderr)
 	}
 
-	// An authorization server that cannot be reached is a failed call, not a refused sign-in.
-	as.srv.Close()
+	// An authorization server that cannot be reached is a failed call, not a refused sign-in. The
+	// server keeps its port and the sign-in's connections are refused: a closed server's port is
+	// free for any process to take, and go test ./... runs the packages' test binaries at once, so
+	// another package's test server could answer on it.
+	ts.session.HTTP.Transport = &http.Transport{DialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
+		tcp, err := net.ResolveTCPAddr(network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return nil, &net.OpError{Op: "dial", Net: network, Addr: tcp, Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+	}}
+	before := as.requests.Load()
 	res = signedIn(t, context.Background(), ts, env, "whoami")
 	if res.code != exitFailed || !strings.Contains(res.stderr, "refreshing the sign-in") {
 		t.Fatalf("unreachable: exit %d, stderr %q", res.code, res.stderr)
@@ -301,6 +320,9 @@ func TestARefusedRefreshAsksForANewSignIn(t *testing.T) {
 		"--pull-request", "1", "--terraform-plan-json", "missing.json", "--terraform-state-json", "missing.json")
 	if res.code != exitFailed || !strings.Contains(res.stderr, "refreshing the sign-in") {
 		t.Errorf("estimate apply: exit %d, stderr %q", res.code, res.stderr)
+	}
+	if n := as.requests.Load() - before; n != 0 {
+		t.Errorf("the unreachable authorization server received %d requests", n)
 	}
 }
 

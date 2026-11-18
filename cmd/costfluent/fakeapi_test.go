@@ -131,7 +131,9 @@ func (api *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ok = false
 	}
 	if !ok {
-		problem(w, http.StatusNotFound, map[string]any{"code": "not_found", "detail": "no such route: " + r.URL.Path})
+		// The Public API's answer to a path no operation serves; not_found would read as a missing object.
+		problem(w, http.StatusNotFound, map[string]any{"type": "about:blank", "title": "Resource Not Found",
+			"code": "operation_not_found", "detail": "no such route: " + r.URL.Path, "retryable": false, "traceId": "trace-404"})
 		return
 	}
 	if !slices.Contains(tok.capabilities, route.need) {

@@ -24,9 +24,13 @@ import (
 // session starts the server for secret against baseURL and connects a client to it in memory.
 func session(t *testing.T, baseURL, secret string) *mcp.ClientSession {
 	t.Helper()
-	ctx := context.Background()
-	client := costfluent.NewClient(costfluent.WithAPIKey(secret), costfluent.WithBaseURL(baseURL))
-	srv, _, err := New(ctx, client, "test")
+	return sessionOf(t, costfluent.NewClient(costfluent.WithAPIKey(secret), costfluent.WithBaseURL(baseURL)))
+}
+
+// sessionOf starts the server over client and connects a client to it in memory.
+func sessionOf(t *testing.T, client *costfluent.Client) *mcp.ClientSession {
+	t.Helper()
+	srv, _, err := New(context.Background(), client, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +406,8 @@ func TestEveryCallCarriesTheStartupToken(t *testing.T) {
 func TestTheTokenIsNeverEchoed(t *testing.T) {
 	t.Parallel()
 	api, srv := newFakeAPI(t, map[string]token{tokenSecret: {workspace: ownWS, capabilities: allCapabilities}})
-	cs := session(t, srv.URL, tokenSecret)
+	client, refuse := refusableClient(t, srv.URL, tokenSecret)
+	cs := sessionOf(t, client)
 
 	var seen []string
 	record := func(v any) {
@@ -431,7 +436,7 @@ func TestTheTokenIsNeverEchoed(t *testing.T) {
 	}
 	// One call: the SDK retries an unreachable API with backoff, and the error text is the same
 	// transport error for every tool.
-	srv.Close()
+	refuse()
 	record(call(t, cs, "list_budgets", nil))
 
 	for _, s := range seen {
@@ -585,7 +590,8 @@ func TestAFailedCallCarriesOnlyTheError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			api, srv := newFakeAPI(t, map[string]token{tokenSecret: {workspace: ownWS, capabilities: allCapabilities}})
-			cs := session(t, srv.URL, tokenSecret)
+			client, refuse := refusableClient(t, srv.URL, tokenSecret)
+			cs := sessionOf(t, client)
 
 			ok := call(t, cs, tc.name, tc.args)
 			if ok.IsError || ok.StructuredContent == nil {
@@ -612,11 +618,15 @@ func TestAFailedCallCarriesOnlyTheError(t *testing.T) {
 			}
 
 			// The SDK retries an unreachable API with backoff before it gives up.
-			srv.Close()
+			refuse()
+			before := len(api.received())
 			res := call(t, cs, tc.name, tc.args)
 			failed(t, res)
 			if !strings.Contains(text(res), "connect") {
 				t.Errorf("transport error text %q does not name the failed connection", text(res))
+			}
+			if n := len(api.received()) - before; n != 0 {
+				t.Errorf("the unreachable API received %d requests", n)
 			}
 		})
 	}
@@ -667,6 +677,40 @@ func TestNewFailsOnATokenWithNoReadCapability(t *testing.T) {
 	namesEveryCapability(t, err)
 	if strings.Contains(err.Error(), tokenSecret) {
 		t.Fatalf("the error discloses the token: %v", err)
+	}
+}
+
+// A token that carries only write capabilities, in an organization that keeps agents read-only, is
+// served no tool, and its error says the setting serves its write tools rather than only sending
+// the customer to create a Read only token. A token with no write capability is not told so, with
+// the setting off or on. With the setting on, a token carrying a write capability is served its
+// write tools and New succeeds, so no refused token reaches the hint with the setting on.
+func TestNewNamesTheAgentWritesSettingToAWriteOnlyToken(t *testing.T) {
+	const note = "its write tools are served once an Owner turns on"
+	cases := map[string]struct {
+		capabilities []costfluent.Capability
+		agentWrites  bool
+		named        bool
+	}{
+		"a write-only token with the setting off":       {[]costfluent.Capability{costfluent.CapabilityCreateBudget}, false, true},
+		"a token with no write capability, setting off": {[]costfluent.Capability{costfluent.CapabilityViewProviders}, false, false},
+		"a token with no write capability, setting on":  {[]costfluent.Capability{costfluent.CapabilityViewProviders}, true, false},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			api, srv := newFakeAPI(t, map[string]token{tokenSecret: {workspace: ownWS, capabilities: c.capabilities}})
+			api.setAgentWrites(c.agentWrites)
+			client := costfluent.NewClient(costfluent.WithAPIKey(tokenSecret), costfluent.WithBaseURL(srv.URL))
+
+			_, _, err := New(context.Background(), client, "test")
+			if err == nil {
+				t.Fatal("started with a token no tool is served to")
+			}
+			named := strings.Contains(err.Error(), note) && strings.Contains(err.Error(), AgentWritesSetting)
+			if named != c.named {
+				t.Errorf("the error names the agent writes setting: %t, want %t: %v", named, c.named, err)
+			}
+		})
 	}
 }
 
@@ -1385,7 +1429,7 @@ func TestBuildRefusesATokenNoToolCanUse(t *testing.T) {
 
 func TestBuildHostedTellsACallerTheAPIWasUnreachableWithoutItsAddress(t *testing.T) {
 	_, srv := newFakeAPI(t, map[string]token{tokenSecret: {workspace: ownWS, capabilities: allCapabilities}})
-	client := costfluent.NewClient(costfluent.WithAPIKey(tokenSecret), costfluent.WithBaseURL(srv.URL))
+	client, refuse := refusableClient(t, srv.URL, tokenSecret)
 	me, err := client.GetMe(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1402,7 +1446,7 @@ func TestBuildHostedTellsACallerTheAPIWasUnreachableWithoutItsAddress(t *testing
 	if res := call(t, hostedSession, "list_anomalies", map[string]any{"severity": "dire"}); !strings.Contains(text(res), "severity must be one of") {
 		t.Errorf("a hosted call's own validation error was replaced: %s", text(res))
 	}
-	srv.Close()
+	refuse()
 
 	res := call(t, hostedSession, "list_workspaces", nil)
 	host := strings.TrimPrefix(srv.URL, "http://")
